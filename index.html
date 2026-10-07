@@ -845,7 +845,7 @@ nav.tabs button.active{color:#657f19;}
     // run here, so this must be your deployed Web App's /exec URL, hardcoded.
     // Apps Script → Deploy → Manage deployments → copy the "Web app" URL.
     // >>> REPLACE THE LINE BELOW WITH YOUR OWN /exec URL <<<
-    API_URL: "https://script.google.com/macros/s/AKfycbwmMpB7DEYB7qZALm1DDN188pZ2FXACe9eYKsdPSrvkNOYbdsAlyZG33ZEx1zOQwYIq/exec",
+    API_URL: "https://script.google.com/macros/s/PASTE_YOUR_DEPLOYMENT_ID_HERE/exec",
     // For the "Sign in with Google" button on the login screen. Create one at
     // https://console.cloud.google.com/apis/credentials → "Create credentials"
     // → "OAuth client ID" → Application type "Web application" → add this
@@ -853,8 +853,24 @@ nav.tabs button.active{color:#657f19;}
     // JavaScript origins" (no path, no trailing slash). Client IDs are public
     // by design — safe to leave visible in this file, unlike API_URL secrets.
     // Leave the placeholder as-is to simply hide the Google button.
-    GOOGLE_CLIENT_ID: "PASTE_YOUR_GOOGLE_CLIENT_ID_HERE.apps.googleusercontent.com"
+    GOOGLE_CLIENT_ID: "PASTE_YOUR_GOOGLE_CLIENT_ID_HERE.apps.googleusercontent.com",
+    // Supabase Auth (Phase 2 migration). Find these at Supabase → Settings → API.
+    // The anon key is safe to expose publicly — it only works within the RLS
+    // policies already set up on the database (see money_manager_schema.sql).
+    SUPABASE_URL: "https://qmcretdtogypacnrwsej.supabase.co",
+    SUPABASE_ANON_KEY: "sb_publishable_iliua7UwgE29ncpFYyL0uw_c3jGYziX"
   };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+  let supabaseClient;
+  try {
+    if (typeof supabase === 'undefined') throw new Error('โหลดไลบรารี supabase-js ไม่สำเร็จ (เช็คอินเทอร์เน็ต/ตัวบล็อกโฆษณา)');
+    supabaseClient = supabase.createClient(APP_CONFIG.SUPABASE_URL, APP_CONFIG.SUPABASE_ANON_KEY);
+  } catch (e) {
+    console.error('Supabase init failed:', e);
+    document.addEventListener('DOMContentLoaded', () => alert('เชื่อมต่อ Supabase ไม่สำเร็จ: ' + e.message));
+  }
 </script>
 
 <div id="toastStack"></div>
@@ -903,9 +919,9 @@ nav.tabs button.active{color:#657f19;}
     </div>
     <h1>Money Manager AI</h1>
     <p class="tagline">สมุดบันทึกการเงินของคุณ เชื่อมกับ LINE หรือสมัครด้วยอีเมลก็ได้</p>
-    <div class="login-mode-tabs" style="display:flex;gap:8px;width:100%;max-width:330px;margin-bottom:12px;">
-      <button id="loginTabPin" class="login-mode-btn active" onclick="showLoginTab('pin')" style="flex:1;">LINE PIN</button>
-      <button id="loginTabEmail" class="login-mode-btn" onclick="showLoginTab('email')" style="flex:1;">อีเมล</button>
+    <div class="login-mode-tabs" style="display:none;gap:8px;width:100%;max-width:330px;margin-bottom:12px;">
+      <button id="loginTabPin" class="login-mode-btn" onclick="showLoginTab('pin')" style="flex:1;display:none;">LINE PIN</button>
+      <button id="loginTabEmail" class="login-mode-btn active" onclick="showLoginTab('email')" style="flex:1;">อีเมล</button>
     </div>
     <div class="card">
       <div id="loginError" class="error" style="display:none;"></div>
@@ -1124,24 +1140,6 @@ function localStorage_safe_remove(k){ try{ localStorage.removeItem(k); }catch(e)
 /* ============================================================
  * API HELPERS
  * ============================================================ */
-// True once we've already bounced the person to the login screen for this
-// expiry, so a burst of in-flight requests that all come back Unauthorized
-// at once (dashboard + list + accounts firing together) doesn't show the
-// "session expired" toast three times or fight over the screen switch.
-let SESSION_EXPIRY_HANDLED_ = false;
-
-function handleSessionExpired_() {
-  if (SESSION_EXPIRY_HANDLED_) return;
-  SESSION_EXPIRY_HANDLED_ = true;
-  STATE.token = ''; STATE.userId = ''; STATE.displayName = '';
-  localStorage_safe_remove('mma_token'); localStorage_safe_remove('mma_userId'); localStorage_safe_remove('mma_displayName');
-  const appEl = document.getElementById('app');
-  if (appEl) appEl.style.display = 'none';
-  const loginEl = document.getElementById('loginScreen');
-  if (loginEl) loginEl.style.display = 'flex';
-  toast('เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่', 'error');
-}
-
 async function fetchJson(url, options) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 20000);
@@ -1152,11 +1150,9 @@ async function fetchJson(url, options) {
     try { data = JSON.parse(text); }
     catch (_) { throw new Error('เซิร์ฟเวอร์ตอบกลับข้อมูลไม่ใช่ JSON'); }
     if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
-    if (data && data.error === 'Unauthorized' && STATE.token) handleSessionExpired_();
     return data;
   } catch (e) {
     if (e && e.name === 'AbortError') throw new Error('การเชื่อมต่อใช้เวลานานเกินไป กรุณาลองใหม่');
-    if (e && e.message === 'Unauthorized' && STATE.token) handleSessionExpired_();
     throw e;
   } finally {
     clearTimeout(timeoutId);
@@ -1172,6 +1168,7 @@ function ensureApiConfigured() {
 }
 
 async function apiGet(action, params) {
+  if (SB_GET_ACTIONS_[action]) return SB_GET_ACTIONS_[action](params || {});
   params = Object.assign({}, params || {}, { action: action });
   if (STATE.token) params.token = STATE.token;
   const qs = Object.keys(params).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(params[k] == null ? '' : params[k])).join('&');
@@ -1179,6 +1176,7 @@ async function apiGet(action, params) {
 }
 
 async function apiPost(action, body) {
+  if (SB_POST_ACTIONS_[action]) return SB_POST_ACTIONS_[action](body || {});
   body = Object.assign({}, body || {}, { action: action });
   if (STATE.token) body.token = STATE.token;
   return fetchJson(ensureApiConfigured(), {
@@ -1187,6 +1185,590 @@ async function apiPost(action, body) {
     body: JSON.stringify(body)
   });
 }
+
+/* ============================================================
+ * PHASE 5: SUPABASE DATA LAYER
+ * Ports the core money-tracking logic (categories, accounts, budgets,
+ * transactions + the account-balance math that goes with them) straight
+ * from 444.gs (apiCategories_/apiAccounts_/apiBudget_/apiCreateTransaction_
+ * etc.) so these no longer need Apps Script at all.
+ *
+ * NOT ported yet — these still call Apps Script via apiGet/apiPost below:
+ * debts, recurring transactions, the LINE-style natural-language "ai-command"
+ * bot, admin config (config-status/update-config), and the maintenance tools
+ * (rebuild-balances, bulk-reassign-account, audit-cash). Porting those too
+ * needs its own careful pass — mixing them into this one risked subtle bugs
+ * in money math, so they're a deliberate follow-up rather than skipped.
+ * ============================================================ */
+
+function sbRow_(o) { return o; } // no-op placeholder kept for readability at call sites
+
+async function sbAdjustAccountBalance_(accountId, delta) {
+  if (!accountId || !delta) return;
+  const { data: acc, error } = await supabaseClient.from('accounts').select('current_balance').eq('account_id', accountId).single();
+  if (error || !acc) return;
+  await supabaseClient.from('accounts').update({ current_balance: Number(acc.current_balance || 0) + delta }).eq('account_id', accountId);
+}
+
+/** sign: +1 to apply a transaction's effect on balances, -1 to reverse it (edit/cancel). */
+async function sbApplyBalanceEffect_(type, accountId, amount, toAccountId, sign) {
+  if (type === 'transfer') {
+    await sbAdjustAccountBalance_(accountId, -amount * sign);
+    await sbAdjustAccountBalance_(toAccountId, amount * sign);
+  } else if (type === 'income') {
+    await sbAdjustAccountBalance_(accountId, amount * sign);
+  } else {
+    await sbAdjustAccountBalance_(accountId, -amount * sign);
+  }
+}
+
+/* ---------- CATEGORIES ---------- */
+async function sbGetCategories_() {
+  const { data, error } = await supabaseClient.from('categories').select('*')
+    .or(`user_id.is.null,user_id.eq.${STATE.userId}`).eq('status', 'active');
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: data.map(c => ({ CategoryID: c.category_id, CategoryName: c.category_name, Type: c.type, Icon: c.icon, Status: c.status })) };
+}
+async function sbCreateCategory_(body) {
+  const name = String(body.categoryName || '').trim().slice(0, 40);
+  if (!name) return { success: false, error: 'กรุณาใส่ชื่อหมวดหมู่' };
+  const type = body.type === 'income' ? 'income' : 'expense';
+  const { data: existing } = await supabaseClient.from('categories').select('category_id')
+    .eq('user_id', STATE.userId).eq('category_name', name).eq('type', type).neq('status', 'archived').limit(1);
+  if (existing && existing.length) return { success: false, error: 'มีหมวดหมู่นี้อยู่แล้ว' };
+  const { data, error } = await supabaseClient.from('categories').insert({
+    user_id: STATE.userId, category_name: name, type, icon: String(body.icon || '📁').trim().slice(0, 4) || '📁', status: 'active'
+  }).select().single();
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: { id: data.category_id } };
+}
+async function sbArchiveCategory_(body) {
+  const { error } = await supabaseClient.from('categories').update({ status: 'archived' })
+    .eq('category_id', body.categoryId).eq('user_id', STATE.userId);
+  if (error) return { success: false, error: 'ไม่พบหมวดหมู่นี้' };
+  return { success: true };
+}
+
+/* ---------- ACCOUNTS ---------- */
+const SB_ACCOUNT_TYPES_ = ['cash', 'bank', 'wallet', 'card'];
+async function sbGetAccounts_() {
+  const { data, error } = await supabaseClient.from('accounts').select('*').eq('user_id', STATE.userId).neq('status', 'archived');
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: data.map(a => ({
+    AccountID: a.account_id, AccountName: a.account_name, AccountType: a.account_type,
+    OpeningBalance: a.opening_balance, CurrentBalance: a.current_balance, Currency: a.currency, Status: a.status
+  })) };
+}
+async function sbCreateAccount_(body) {
+  const name = String(body.accountName || '').trim().slice(0, 60);
+  if (!name) return { success: false, error: 'กรุณาใส่ชื่อบัญชี' };
+  const type = body.accountType || 'wallet';
+  if (!SB_ACCOUNT_TYPES_.includes(type)) return { success: false, error: 'ประเภทบัญชีไม่ถูกต้อง' };
+  const opening = Number(body.openingBalance || 0);
+  const { data, error } = await supabaseClient.from('accounts').insert({
+    user_id: STATE.userId, account_name: name, account_type: type,
+    opening_balance: opening, current_balance: opening, currency: 'THB', status: 'active'
+  }).select().single();
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: { accountId: data.account_id } };
+}
+async function sbUpdateAccount_(body) {
+  if (!body.accountId) return { success: false, error: 'ต้องระบุ accountId' };
+  const updates = {};
+  if (body.accountName) {
+    const name = String(body.accountName).trim().slice(0, 60);
+    if (!name) return { success: false, error: 'ชื่อบัญชีห้ามว่าง' };
+    updates.account_name = name;
+  }
+  if (body.accountType) {
+    if (!SB_ACCOUNT_TYPES_.includes(body.accountType)) return { success: false, error: 'ประเภทบัญชีไม่ถูกต้อง' };
+    updates.account_type = body.accountType;
+  }
+  const { error } = await supabaseClient.from('accounts').update(updates).eq('account_id', body.accountId).eq('user_id', STATE.userId);
+  if (error) return { success: false, error: 'ไม่พบบัญชีนี้' };
+  return { success: true };
+}
+async function sbArchiveAccount_(body) {
+  if (!body.accountId) return { success: false, error: 'ต้องระบุ accountId' };
+  const restoring = body.restore === true || body.restore === 'true';
+  const { data: acc } = await supabaseClient.from('accounts').select('current_balance').eq('account_id', body.accountId).eq('user_id', STATE.userId).single();
+  if (!acc) return { success: false, error: 'ไม่พบบัญชีนี้' };
+  if (!restoring && Number(acc.current_balance || 0) !== 0) {
+    return { success: false, error: 'ต้องย้ายยอดเงินออกจนเหลือ ฿0 ก่อนถึงจะปิดบัญชีนี้ได้' };
+  }
+  await supabaseClient.from('accounts').update({ status: restoring ? 'active' : 'archived' }).eq('account_id', body.accountId);
+  return { success: true };
+}
+
+/* ---------- BUDGETS ---------- */
+async function sbGetBudgets_(params) {
+  const month = params.month || new Date().toISOString().slice(0, 7);
+  const { data: budgets, error } = await supabaseClient.from('budgets').select('*').eq('user_id', STATE.userId).eq('month', month);
+  if (error) return { success: false, error: error.message };
+  // used_amount ไม่ได้เก็บสดเหมือน GAS (ที่อัปเดตทุกครั้งที่บันทึกรายการ) — คำนวณสดจาก
+  // transactions ตอน query แทน ผลลัพธ์เหมือนกัน แค่คำนวณช้ากว่าเล็กน้อยตอนเปิดหน้า
+  const { data: txs } = await supabaseClient.from('transactions').select('category,amount')
+    .eq('user_id', STATE.userId).eq('type', 'expense').eq('status', 'confirmed')
+    .gte('transaction_date', month + '-01').lt('transaction_date', month + '-32');
+  const usedByCategory = {};
+  (txs || []).forEach(t => { usedByCategory[t.category] = (usedByCategory[t.category] || 0) + Number(t.amount || 0); });
+  const items = budgets.map(b => {
+    const used = usedByCategory[b.category] || 0;
+    const amt = Number(b.budget_amount || 0);
+    return {
+      BudgetID: b.budget_id, Month: b.month, CategoryID: b.category, BudgetAmount: amt,
+      UsedAmount: used, RemainingAmount: amt - used, PercentageUsed: amt > 0 ? Math.round((used / amt) * 100) : 0
+    };
+  });
+  return { success: true, data: items };
+}
+async function sbSetBudget_(body) {
+  const month = body.month || new Date().toISOString().slice(0, 7);
+  const amount = Number(body.amount || 0);
+  const { data: existing } = await supabaseClient.from('budgets').select('budget_id')
+    .eq('user_id', STATE.userId).eq('month', month).eq('category', body.category).limit(1);
+  if (existing && existing.length) {
+    await supabaseClient.from('budgets').update({ budget_amount: amount }).eq('budget_id', existing[0].budget_id);
+  } else {
+    await supabaseClient.from('budgets').insert({ user_id: STATE.userId, month, category: body.category, budget_amount: amount });
+  }
+  return { success: true };
+}
+async function sbDeleteBudget_(body) {
+  const { error } = await supabaseClient.from('budgets').delete().eq('budget_id', body.budgetId).eq('user_id', STATE.userId);
+  if (error) return { success: false, error: 'ไม่พบงบประมาณนี้' };
+  return { success: true };
+}
+
+/* ---------- TRANSACTIONS ---------- */
+function sbTxRow_(t) {
+  return {
+    ID: t.id, TransactionDate: t.transaction_date, TransactionTime: t.transaction_time,
+    Type: t.type, Amount: t.amount, Category: t.category, Description: t.description, Merchant: t.merchant,
+    AccountID: t.account_id, PaymentMethod: t.payment_method, SlipURL: t.slip_url, SlipFileID: t.slip_file_id,
+    SlipRefNumber: t.slip_ref_number, Source: t.source, Status: t.status
+  };
+}
+async function sbGetTransactions_(params) {
+  let q = supabaseClient.from('transactions').select('*', { count: 'exact' }).eq('user_id', STATE.userId);
+  if (params.search) q = q.or(`description.ilike.%${params.search}%,merchant.ilike.%${params.search}%,category.ilike.%${params.search}%`);
+  if (params.type) q = q.eq('type', params.type);
+  if (params.status) q = q.eq('status', params.status); else q = q.neq('status', 'cancelled');
+  if (params.dateFrom) q = q.gte('transaction_date', params.dateFrom);
+  if (params.dateTo) q = q.lte('transaction_date', params.dateTo);
+  const sortAsc = params.sortDir === 'asc';
+  q = q.order('transaction_date', { ascending: sortAsc }).order('transaction_time', { ascending: sortAsc });
+  const page = Number(params.page || 1), pageSize = Number(params.pageSize || 15);
+  q = q.range((page - 1) * pageSize, page * pageSize - 1);
+  const { data, error, count } = await q;
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: { items: data.map(sbTxRow_), total: count, page, pageSize } };
+}
+async function sbCreateTransaction_(body) {
+  const type = body.type;
+  if (!['expense', 'income', 'transfer'].includes(type)) return { success: false, error: 'ประเภทรายการไม่ถูกต้อง' };
+  const amount = Number(body.amount || 0);
+  if (!amount || amount <= 0) return { success: false, error: 'กรุณาระบุจำนวนเงินให้ถูกต้อง' };
+  if (body.slipRefNumber) {
+    const { data: dup } = await supabaseClient.from('transactions').select('id,transaction_date,amount')
+      .eq('user_id', STATE.userId).eq('slip_ref_number', body.slipRefNumber).neq('status', 'cancelled').limit(1);
+    if (dup && dup.length) return { success: false, error: `สลิปนี้เคยถูกบันทึกไปแล้ว (รายการ ${dup[0].id}, ${dup[0].transaction_date}, ฿${dup[0].amount})` };
+  }
+  const date = body.date || new Date().toLocaleDateString('en-CA');
+  const time = body.time || new Date().toTimeString().slice(0, 5);
+  let accountId, toAccountId = null, category = '';
+  if (type === 'transfer') {
+    if (!body.fromAccountId || !body.toAccountId) return { success: false, error: 'กรุณาเลือกบัญชีต้นทางและปลายทาง' };
+    if (body.fromAccountId === body.toAccountId) return { success: false, error: 'บัญชีต้นทางและปลายทางต้องไม่ใช่บัญชีเดียวกัน' };
+    accountId = body.fromAccountId; toAccountId = body.toAccountId; category = 'โอนเงิน';
+  } else {
+    if (!body.accountId) return { success: false, error: 'กรุณาเลือกบัญชี' };
+    if (!body.category) return { success: false, error: 'กรุณาเลือกหมวดหมู่' };
+    accountId = body.accountId; category = body.category;
+  }
+  const { data: inserted, error } = await supabaseClient.from('transactions').insert({
+    user_id: STATE.userId, type, amount, category, description: body.description || '', merchant: body.merchant || '',
+    account_id: accountId, transfer_to_account_id: toAccountId, payment_method: body.paymentMethod || '',
+    slip_url: body.slipUrl || '', slip_file_id: body.slipFileId || '', slip_ref_number: body.slipRefNumber || '',
+    source: 'dashboard', ai_confidence: 1, status: 'confirmed', transaction_date: date, transaction_time: time
+  }).select().single();
+  if (error) return { success: false, error: error.message };
+  await sbApplyBalanceEffect_(type, accountId, amount, toAccountId, 1);
+  return { success: true, data: { id: inserted.id } };
+}
+async function sbEditTransaction_(body) {
+  if (!body.id) return { success: false, error: 'ต้องระบุรายการ' };
+  const { data: old, error: fetchErr } = await supabaseClient.from('transactions').select('*').eq('id', body.id).eq('user_id', STATE.userId).single();
+  if (fetchErr || !old) return { success: false, error: 'ไม่พบรายการนี้' };
+  // ย้อนผลของยอดเก่าก่อน (ถ้ายังไม่ถูกยกเลิกไปแล้ว) แล้วค่อยใส่ผลของยอดใหม่ทับ
+  if (old.status === 'confirmed') {
+    await sbApplyBalanceEffect_(old.type, old.account_id, Number(old.amount), old.transfer_to_account_id, -1);
+  }
+  const updates = {};
+  ['amount', 'category', 'description', 'merchant', 'payment_method'].forEach(f => {
+    const bodyKey = f === 'payment_method' ? 'paymentMethod' : f;
+    if (body[bodyKey] !== undefined) updates[f] = body[bodyKey];
+  });
+  if (body.date) updates.transaction_date = body.date;
+  if (body.time) updates.transaction_time = body.time;
+  if (body.accountId) updates.account_id = body.accountId;
+  const { error } = await supabaseClient.from('transactions').update(updates).eq('id', body.id);
+  if (error) return { success: false, error: error.message };
+  if (old.status === 'confirmed') {
+    const newAmount = updates.amount !== undefined ? Number(updates.amount) : Number(old.amount);
+    const newAccountId = updates.account_id || old.account_id;
+    await sbApplyBalanceEffect_(old.type, newAccountId, newAmount, old.transfer_to_account_id, 1);
+  }
+  return { success: true };
+}
+async function sbCancelTransaction_(body) {
+  const { data: tx } = await supabaseClient.from('transactions').select('*').eq('id', body.id).eq('user_id', STATE.userId).single();
+  if (!tx) return { success: false, error: 'ไม่พบรายการนี้' };
+  if (tx.status === 'confirmed') {
+    await sbApplyBalanceEffect_(tx.type, tx.account_id, Number(tx.amount), tx.transfer_to_account_id, -1);
+  }
+  await supabaseClient.from('transactions').update({ status: 'cancelled' }).eq('id', body.id);
+  return { success: true };
+}
+async function sbConfirmTransaction_(body) {
+  const { data: tx } = await supabaseClient.from('transactions').select('*').eq('id', body.id).eq('user_id', STATE.userId).single();
+  if (!tx) return { success: false, error: 'ไม่พบรายการนี้' };
+  if (tx.status !== 'confirmed') {
+    await supabaseClient.from('transactions').update({ status: 'confirmed' }).eq('id', body.id);
+    await sbApplyBalanceEffect_(tx.type, tx.account_id, Number(tx.amount), tx.transfer_to_account_id, 1);
+  }
+  return { success: true };
+}
+
+/* ---------- DEBTS ---------- */
+const SB_DEBT_TYPES_ = ['loan', 'credit_card', 'personal', 'other'];
+const SB_DEBT_ICON_ = { loan: '🏦', credit_card: '💳', personal: '🤝', other: '📄' };
+const SB_DEBT_LABEL_ = { loan: 'สินเชื่อ', credit_card: 'บัตรเครดิต', personal: 'ยืมส่วนตัว', other: 'อื่นๆ' };
+function sbNextDueDate_(dueDay, from) {
+  dueDay = Math.min(Math.max(Number(dueDay) || 1, 1), 28);
+  let d = new Date(from.getFullYear(), from.getMonth(), dueDay);
+  if (d < from) d = new Date(from.getFullYear(), from.getMonth() + 1, dueDay);
+  const daysUntil = Math.round((d - new Date(from.getFullYear(), from.getMonth(), from.getDate())) / 86400000);
+  return { date: d.toISOString().slice(0, 10), daysUntil };
+}
+function sbDebtComputed_(d) {
+  const now = new Date();
+  const next = sbNextDueDate_(d.due_day, now);
+  const lastPayment = d.last_payment_date ? new Date(d.last_payment_date) : null;
+  const startOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  const thisMonthDue = new Date(now.getFullYear(), now.getMonth(), Math.min(Math.max(Number(d.due_day) || 1, 1), 28));
+  const remaining = Number(d.remaining_amount || 0), total = Number(d.total_amount || 0);
+  const isOverdue = remaining > 0 && now > thisMonthDue && (!lastPayment || lastPayment < startOfThisMonth);
+  const isDueSoon = !isOverdue && remaining > 0 && next.daysUntil >= 0 && next.daysUntil <= 3;
+  return {
+    id: d.debt_id, name: d.debt_name, type: d.debt_type, icon: SB_DEBT_ICON_[d.debt_type] || '📄', typeLabel: SB_DEBT_LABEL_[d.debt_type] || d.debt_type,
+    totalAmount: total, remainingAmount: remaining, paidAmount: total - remaining,
+    percentPaid: total > 0 ? Math.round((total - remaining) / total * 100) : 0,
+    interestRate: Number(d.interest_rate || 0), minimumPayment: Number(d.minimum_payment || 0),
+    dueDay: Number(d.due_day || 1), nextDueDate: next.date, daysUntilDue: next.daysUntil,
+    lastPaymentDate: d.last_payment_date || '', status: d.status, isOverdue, isDueSoon
+  };
+}
+async function sbGetDebts_() {
+  const { data, error } = await supabaseClient.from('debts').select('*').eq('user_id', STATE.userId);
+  if (error) return { success: false, error: error.message };
+  const items = data.map(sbDebtComputed_).sort((a, b) => {
+    if ((a.status === 'paid_off') !== (b.status === 'paid_off')) return a.status === 'paid_off' ? 1 : -1;
+    if (a.isOverdue !== b.isOverdue) return a.isOverdue ? -1 : 1;
+    if (a.isDueSoon !== b.isDueSoon) return a.isDueSoon ? -1 : 1;
+    return a.daysUntilDue - b.daysUntilDue;
+  });
+  return { success: true, data: { items } };
+}
+async function sbCreateDebt_(body) {
+  const name = String(body.debtName || '').trim().slice(0, 80);
+  if (!name) return { success: false, error: 'กรุณาใส่ชื่อหนี้สิน' };
+  const type = body.debtType || 'other';
+  if (!SB_DEBT_TYPES_.includes(type)) return { success: false, error: 'ประเภทหนี้สินไม่ถูกต้อง' };
+  const total = Number(body.totalAmount || 0);
+  if (!total || total <= 0) return { success: false, error: 'กรุณาระบุยอดหนี้ทั้งหมดให้ถูกต้อง' };
+  const dueDay = Math.min(Math.max(Number(body.dueDay || 1), 1), 28);
+  const { data, error } = await supabaseClient.from('debts').insert({
+    user_id: STATE.userId, debt_name: name, debt_type: type, total_amount: total,
+    remaining_amount: Number(body.remainingAmount != null ? body.remainingAmount : total),
+    interest_rate: Number(body.interestRate || 0), minimum_payment: Number(body.minimumPayment || 0),
+    due_day: dueDay, status: 'active'
+  }).select().single();
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: { debtId: data.debt_id } };
+}
+async function sbUpdateDebt_(body) {
+  if (!body.debtId) return { success: false, error: 'ต้องระบุ debtId' };
+  const updates = {};
+  if (body.debtName != null) updates.debt_name = String(body.debtName).trim().slice(0, 80);
+  if (body.debtType != null && SB_DEBT_TYPES_.includes(body.debtType)) updates.debt_type = body.debtType;
+  if (body.totalAmount != null) updates.total_amount = Number(body.totalAmount);
+  if (body.remainingAmount != null) updates.remaining_amount = Math.max(0, Number(body.remainingAmount));
+  if (body.interestRate != null) updates.interest_rate = Number(body.interestRate);
+  if (body.minimumPayment != null) updates.minimum_payment = Number(body.minimumPayment);
+  if (body.dueDay != null) updates.due_day = Math.min(Math.max(Number(body.dueDay), 1), 28);
+  if (body.postponeToNextMonth) updates.last_payment_date = new Date().toISOString().slice(0, 10);
+  const { error } = await supabaseClient.from('debts').update(updates).eq('debt_id', body.debtId).eq('user_id', STATE.userId);
+  if (error) return { success: false, error: 'ไม่พบหนี้สินนี้' };
+  return { success: true };
+}
+async function sbDeleteDebt_(body) {
+  const { error } = await supabaseClient.from('debts').delete().eq('debt_id', body.debtId).eq('user_id', STATE.userId);
+  if (error) return { success: false, error: 'ไม่พบหนี้สินนี้' };
+  return { success: true };
+}
+async function sbPayDebt_(body) {
+  const amount = Number(body.amount || 0);
+  if (!amount || amount <= 0) return { success: false, error: 'กรุณาระบุจำนวนเงินให้ถูกต้อง' };
+  const { data: d } = await supabaseClient.from('debts').select('*').eq('debt_id', body.debtId).eq('user_id', STATE.userId).single();
+  if (!d) return { success: false, error: 'ไม่พบหนี้สินนี้' };
+  const newRemaining = Math.max(0, Number(d.remaining_amount || 0) - amount);
+  const today = new Date().toISOString().slice(0, 10);
+  await supabaseClient.from('debts').update({ remaining_amount: newRemaining, last_payment_date: today, status: newRemaining <= 0 ? 'paid_off' : 'active' }).eq('debt_id', body.debtId);
+
+  let txId = '';
+  if (body.accountId) {
+    const { data: tx } = await supabaseClient.from('transactions').insert({
+      user_id: STATE.userId, type: 'expense', amount, category: 'ชำระหนี้',
+      description: `ชำระ ${d.debt_name}${body.note ? ' — ' + body.note : ''}`,
+      account_id: body.accountId, source: 'dashboard', ai_confidence: 1, status: 'confirmed',
+      transaction_date: today, transaction_time: new Date().toTimeString().slice(0, 5)
+    }).select().single();
+    if (!tx) return { success: false, error: 'ไม่พบบัญชีนี้' };
+    txId = tx.id;
+    await sbApplyBalanceEffect_('expense', body.accountId, amount, null, 1);
+  }
+  await supabaseClient.from('debt_payments').insert({ debt_id: body.debtId, user_id: STATE.userId, amount, transaction_id: txId || null, payment_date: today, note: body.note || '' });
+  return { success: true, data: { remainingAmount: newRemaining, paidOff: newRemaining <= 0, transactionId: txId } };
+}
+async function sbGetDebtPayments_(params) {
+  const { data, error } = await supabaseClient.from('debt_payments').select('*').eq('user_id', STATE.userId).eq('debt_id', params.debtId).order('payment_date', { ascending: false });
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: { items: data.map(p => ({ PaymentID: p.payment_id, DebtID: p.debt_id, Amount: p.amount, PaymentDate: p.payment_date, Note: p.note })) } };
+}
+
+/* ---------- RECURRING TRANSACTIONS ----------
+ * หมายเหตุ: ทำได้แค่ CRUD + ปุ่ม "รันตอนนี้" เท่านั้น — การรันอัตโนมัติทุกวันแบบ
+ * setupRecurringTrigger_ ใน GAS (time-driven trigger) ยังไม่มีตัวแทนใน Supabase
+ * (ต้องตั้ง pg_cron + Edge Function ต่างหาก เป็นงานเพิ่มเติมถ้าต้องการ) */
+async function sbRecurringComputed_(r) {
+  const next = sbNextDueDate_(r.day_of_month, new Date());
+  return {
+    id: r.recurring_id, name: r.name, type: r.type, amount: Number(r.amount || 0), category: r.category,
+    accountId: r.account_id, dayOfMonth: Number(r.day_of_month || 1),
+    lastRunDate: r.last_run_date || '', nextRunDate: next.date, daysUntilNextRun: next.daysUntil, status: r.status
+  };
+}
+async function sbGetRecurring_() {
+  const { data, error } = await supabaseClient.from('recurring_transactions').select('*').eq('user_id', STATE.userId);
+  if (error) return { success: false, error: error.message };
+  const items = (await Promise.all(data.map(sbRecurringComputed_))).sort((a, b) => a.daysUntilNextRun - b.daysUntilNextRun);
+  return { success: true, data: { items } };
+}
+async function sbCreateRecurring_(body) {
+  const name = String(body.name || '').trim().slice(0, 80);
+  if (!name) return { success: false, error: 'กรุณาใส่ชื่อรายการ' };
+  const type = body.type === 'income' ? 'income' : 'expense';
+  const amount = Number(body.amount || 0);
+  if (!amount || amount <= 0) return { success: false, error: 'กรุณาระบุจำนวนเงินให้ถูกต้อง' };
+  if (!body.accountId) return { success: false, error: 'กรุณาเลือกบัญชี' };
+  const dayOfMonth = Math.min(Math.max(Number(body.dayOfMonth || 1), 1), 28);
+  const { data, error } = await supabaseClient.from('recurring_transactions').insert({
+    user_id: STATE.userId, name, type, amount,
+    category: body.category || (type === 'income' ? 'รายได้เสริม' : 'อื่นๆ'),
+    account_id: body.accountId, day_of_month: dayOfMonth, status: 'active'
+  }).select().single();
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: { id: data.recurring_id } };
+}
+async function sbUpdateRecurring_(body) {
+  const updates = {};
+  if (body.name != null) updates.name = String(body.name).trim().slice(0, 80);
+  if (body.amount != null) updates.amount = Number(body.amount);
+  if (body.category != null) updates.category = body.category;
+  if (body.accountId != null) updates.account_id = body.accountId;
+  if (body.dayOfMonth != null) updates.day_of_month = Math.min(Math.max(Number(body.dayOfMonth), 1), 28);
+  if (body.status === 'active' || body.status === 'paused') updates.status = body.status;
+  const { error } = await supabaseClient.from('recurring_transactions').update(updates).eq('recurring_id', body.id).eq('user_id', STATE.userId);
+  if (error) return { success: false, error: 'ไม่พบรายการนี้' };
+  return { success: true };
+}
+async function sbDeleteRecurring_(body) {
+  const { error } = await supabaseClient.from('recurring_transactions').delete().eq('recurring_id', body.id).eq('user_id', STATE.userId);
+  if (error) return { success: false, error: 'ไม่พบรายการนี้' };
+  return { success: true };
+}
+async function sbRunRecurringNow_(body) {
+  const { data: r } = await supabaseClient.from('recurring_transactions').select('*').eq('recurring_id', body.id).eq('user_id', STATE.userId).single();
+  if (!r) return { success: false, error: 'ไม่พบรายการนี้' };
+  const today = new Date().toISOString().slice(0, 10);
+  // GAS สร้างเป็น 'pending' ให้รีวิวก่อน แต่หน้าเว็บตอนนี้ยังไม่มี UI ยืนยันรายการ pending
+  // เลยสร้างเป็น 'confirmed' ตรง ๆ ไปก่อน (ผลลัพธ์คือรายการถูกบันทึกทันทีเหมือนกดยืนยันเอง)
+  const { data: tx, error } = await supabaseClient.from('transactions').insert({
+    user_id: STATE.userId, type: r.type, amount: r.amount, category: r.category,
+    description: r.name, account_id: r.account_id, source: 'recurring', ai_confidence: 1,
+    status: 'confirmed', transaction_date: today, transaction_time: new Date().toTimeString().slice(0, 5)
+  }).select().single();
+  if (error) return { success: false, error: error.message };
+  await sbApplyBalanceEffect_(r.type, r.account_id, Number(r.amount), null, 1);
+  await supabaseClient.from('recurring_transactions').update({ last_run_date: today }).eq('recurring_id', body.id);
+  return { success: true, data: { transactionId: tx.id } };
+}
+
+/* ---------- DASHBOARD (ภาพรวม) ---------- */
+const SB_THAI_MONTHS_ = ['', 'มกราคม','กุมภาพันธ์','มีนาคม','เมษายน','พฤษภาคม','มิถุนายน','กรกฎาคม','สิงหาคม','กันยายน','ตุลาคม','พฤศจิกายน','ธันวาคม'];
+function sbThaiMonthLabel_(d) { return `${SB_THAI_MONTHS_[d.getMonth() + 1]} ${d.getFullYear() + 543}`; }
+function sbSumBy_(txs, type) { return txs.filter(t => t.type === type).reduce((s, t) => s + Number(t.amount || 0), 0); }
+function sbTimeToMinutes_(t) { const p = String(t || '0:0').split(':'); return (Number(p[0]) || 0) * 60 + (Number(p[1]) || 0); }
+
+async function sbDashboardFull_() {
+  const now = new Date();
+  const ym = now.toISOString().slice(0, 7);
+  const todayStr = now.toISOString().slice(0, 10);
+  const dayOfMonth = now.getDate();
+  const prevDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const prevYm = prevDate.toISOString().slice(0, 7);
+  const LOW_BALANCE_THRESHOLD = 500, HIGH_SPEND_DAY_MULTIPLIER = 1.5, DUPLICATE_TIME_WINDOW_MIN = 30;
+
+  const [{ data: allTxs }, { data: accounts }, { data: budgets }, { data: profile }] = await Promise.all([
+    supabaseClient.from('transactions').select('*').eq('user_id', STATE.userId),
+    supabaseClient.from('accounts').select('*').eq('user_id', STATE.userId).neq('status', 'archived'),
+    supabaseClient.from('budgets').select('*').eq('user_id', STATE.userId).eq('month', ym),
+    supabaseClient.from('profiles').select('duplicate_check_excluded_categories').eq('user_id', STATE.userId).single()
+  ]);
+
+  const activeTxs = (allTxs || []).filter(t => t.status !== 'cancelled');
+  const thisMonthAll = activeTxs.filter(t => String(t.transaction_date).startsWith(ym));
+  const thisMonthExpense = thisMonthAll.filter(t => t.type === 'expense');
+  const prevMonthExpense = activeTxs.filter(t => t.type === 'expense' && String(t.transaction_date).startsWith(prevYm));
+
+  const monthlyIncome = sbSumBy_(thisMonthAll, 'income'), monthlyExpense = sbSumBy_(thisMonthAll, 'expense');
+
+  const expenseByCategory = {}, incomeByCategory = {};
+  thisMonthAll.forEach(t => {
+    if (t.type === 'expense') expenseByCategory[t.category] = (expenseByCategory[t.category] || 0) + Number(t.amount || 0);
+    else if (t.type === 'income') incomeByCategory[t.category] = (incomeByCategory[t.category] || 0) + Number(t.amount || 0);
+  });
+
+  function bucketExpense(items) {
+    const byCategory = {}; let total = 0;
+    items.forEach(t => { const amt = Number(t.amount || 0); total += amt; byCategory[t.category] = (byCategory[t.category] || 0) + amt; });
+    return { total, byCategory };
+  }
+  const curBucket = bucketExpense(thisMonthExpense), prevBucket = bucketExpense(prevMonthExpense);
+
+  const recent = (allTxs || []).slice()
+    .sort((a, b) => new Date(b.transaction_date + ' ' + b.transaction_time) - new Date(a.transaction_date + ' ' + a.transaction_time))
+    .slice(0, 8).map(sbTxRow_);
+
+  const attentionItems = [];
+  (budgets || []).filter(b => Number(b.percentage_used || (Number(b.budget_amount) > 0 ? 0 : 0)) >= 0).forEach(() => {}); // computed below via sbGetBudgets_-equivalent
+  // งบประมาณ: คำนวณ used สดจาก thisMonthExpense เหมือน sbGetBudgets_ แทนอ่านคอลัมน์ตรงๆ (ไม่ได้เก็บสด)
+  const usedByCategory = {};
+  thisMonthExpense.forEach(t => { usedByCategory[t.category] = (usedByCategory[t.category] || 0) + Number(t.amount || 0); });
+  (budgets || []).forEach(b => {
+    const amt = Number(b.budget_amount || 0), used = usedByCategory[b.category] || 0;
+    const pct = amt > 0 ? Math.round((used / amt) * 100) : 0;
+    if (pct >= 70) {
+      const meta = pct >= 100 ? { emoji: '⛔', label: 'เกินงบ' } : pct >= 90 ? { emoji: '🔴', label: 'ต้องระวัง' } : { emoji: '🟡', label: 'ใกล้เต็ม' };
+      attentionItems.push({ type: 'budget', icon: meta.emoji, text: `งบ${b.category} ${meta.label} (${pct}%)` });
+    }
+  });
+
+  const pendingCount = (allTxs || []).filter(t => t.status === 'pending').length;
+  if (pendingCount > 0) attentionItems.push({ type: 'pending', icon: '⏳', text: `มีรายการรอยืนยัน ${pendingCount} รายการ` });
+
+  (accounts || []).forEach(a => {
+    if (a.account_type === 'card') return;
+    if (Number(a.current_balance || 0) < LOW_BALANCE_THRESHOLD) {
+      attentionItems.push({ type: 'lowBalance', icon: '🏦', text: `บัญชี ${a.account_name} ยอดเหลือน้อย (฿${Number(a.current_balance || 0).toLocaleString()})`, accountId: a.account_id });
+    }
+  });
+
+  const todayTotal = thisMonthExpense.filter(t => t.transaction_date === todayStr).reduce((s, t) => s + Number(t.amount || 0), 0);
+  const priorTotal = thisMonthExpense.filter(t => t.transaction_date !== todayStr).reduce((s, t) => s + Number(t.amount || 0), 0);
+  const avgDaily = dayOfMonth > 1 ? priorTotal / (dayOfMonth - 1) : 0;
+  if (avgDaily > 0 && todayTotal > avgDaily * HIGH_SPEND_DAY_MULTIPLIER) {
+    attentionItems.push({ type: 'highSpendToday', icon: '📈', text: `วันนี้ใช้เงินไปแล้ว ฿${Math.round(todayTotal).toLocaleString()} สูงกว่าค่าเฉลี่ยต่อวัน (฿${Math.round(avgDaily).toLocaleString()})`, date: todayStr });
+  }
+
+  // ตรวจรายการซ้ำ: วันที่+จำนวนเงิน+หมวด+รายละเอียดตรงกัน และห่างกันไม่ถึง 30 นาที
+  // เว้นแต่มีเลขอ้างอิงสลิป/บัญชี/ชื่อร้านต่างกันซึ่งพิสูจน์ว่าเป็นคนละรายการจริง
+  const excludedCategories = (profile && profile.duplicate_check_excluded_categories) || [];
+  const seen = {};
+  thisMonthExpense.forEach(t => {
+    if (excludedCategories.includes(t.category)) return;
+    const key = `${t.transaction_date}|${t.amount}|${t.category}|${(t.description || '').trim().toLowerCase()}`;
+    (seen[key] = seen[key] || []).push(t);
+  });
+  function provenDifferent(a, b) {
+    if (a.slip_ref_number && b.slip_ref_number && String(a.slip_ref_number) !== String(b.slip_ref_number)) return true;
+    if (a.account_id && b.account_id && String(a.account_id) !== String(b.account_id)) return true;
+    if (a.merchant && b.merchant && String(a.merchant).trim() !== String(b.merchant).trim()) return true;
+    return false;
+  }
+  const dupGroups = [];
+  Object.values(seen).forEach(items => {
+    items.sort((a, b) => sbTimeToMinutes_(a.transaction_time) - sbTimeToMinutes_(b.transaction_time));
+    let cluster = [items[0]];
+    for (let i = 1; i < items.length; i++) {
+      const prev = items[i - 1], cur = items[i];
+      const gap = sbTimeToMinutes_(cur.transaction_time) - sbTimeToMinutes_(prev.transaction_time);
+      if (gap <= DUPLICATE_TIME_WINDOW_MIN && !provenDifferent(prev, cur)) cluster.push(cur);
+      else { if (cluster.length > 1) dupGroups.push(cluster.map(sbTxRow_)); cluster = [cur]; }
+    }
+    if (cluster.length > 1) dupGroups.push(cluster.map(sbTxRow_));
+  });
+  if (dupGroups.length > 0) {
+    attentionItems.push({ type: 'duplicate', icon: '🔁', text: `มีรายการที่อาจซ้ำกัน ${dupGroups.length} คู่ (วันที่ จำนวนเงิน หมวด รายละเอียดตรงกัน และเวลาห่างกันไม่ถึง ${DUPLICATE_TIME_WINDOW_MIN} นาที)`, groups: dupGroups });
+  }
+
+  const { data: debtRows } = await supabaseClient.from('debts').select('*').eq('user_id', STATE.userId);
+  const debts = (debtRows || []).map(sbDebtComputed_);
+  const totalDebtRemaining = debts.filter(d => d.status !== 'paid_off').reduce((s, d) => s + d.remainingAmount, 0);
+  debts.forEach(d => {
+    if (d.isOverdue) attentionItems.push({ type: 'debtOverdue', icon: '🔴', text: `หนี้ ${d.name} เลยกำหนดชำระแล้ว (เหลือ ฿${Math.round(d.remainingAmount).toLocaleString()})`, debtId: d.id });
+    else if (d.isDueSoon) attentionItems.push({ type: 'debtDueSoon', icon: '🟡', text: `หนี้ ${d.name} ครบกำหนดใน ${d.daysUntilDue} วัน (เหลือ ฿${Math.round(d.remainingAmount).toLocaleString()})`, debtId: d.id });
+  });
+
+  const { data: recRows } = await supabaseClient.from('recurring_transactions').select('*').eq('user_id', STATE.userId).eq('status', 'active');
+  const recurring = (recRows || []).map(r => ({ name: r.name, amount: Number(r.amount || 0), ...sbNextDueDate_(r.day_of_month, now) }));
+  recurring.filter(r => r.daysUntil >= 0 && r.daysUntil <= 2).forEach(r => {
+    attentionItems.push({ type: 'recurringDueSoon', icon: '🔁', text: (r.daysUntil === 0 ? `รายการประจำ ${r.name} จะรันวันนี้` : `รายการประจำ ${r.name} จะรันในอีก ${r.daysUntil} วัน`) + ` (฿${Math.round(r.amount).toLocaleString()})` });
+  });
+
+  return {
+    success: true,
+    data: {
+      overview: { monthlyIncome, monthlyExpense, balance: monthlyIncome - monthlyExpense, transactionCount: thisMonthAll.length, totalDebtRemaining },
+      recentTransactions: recent,
+      accounts: (accounts || []).map(a => ({ AccountID: a.account_id, AccountName: a.account_name, AccountType: a.account_type, CurrentBalance: a.current_balance, Currency: a.currency })),
+      expenseByCategory, incomeByCategory,
+      comparison: {
+        current: { month: ym, label: sbThaiMonthLabel_(now), total: curBucket.total, byCategory: curBucket.byCategory },
+        previous: { month: prevYm, label: sbThaiMonthLabel_(prevDate), total: prevBucket.total, byCategory: prevBucket.byCategory }
+      },
+      attention: attentionItems
+    }
+  };
+}
+
+// Actions handled locally via Supabase now — everything else still falls
+// through to Apps Script (apiGet/apiPost above) until it gets its own pass.
+const SB_GET_ACTIONS_ = {
+  'categories': sbGetCategories_, 'accounts': sbGetAccounts_, 'budget': sbGetBudgets_, 'transactions': sbGetTransactions_,
+  'debts': sbGetDebts_, 'debt-payments': sbGetDebtPayments_, 'recurring': sbGetRecurring_, 'dashboard-full': sbDashboardFull_
+};
+const SB_POST_ACTIONS_ = {
+  'create-category': sbCreateCategory_, 'archive-category': sbArchiveCategory_,
+  'create-account': sbCreateAccount_, 'update-account': sbUpdateAccount_, 'archive-account': sbArchiveAccount_,
+  'set-budget': sbSetBudget_, 'delete-budget': sbDeleteBudget_,
+  'create-transaction': sbCreateTransaction_, 'edit-transaction': sbEditTransaction_,
+  'cancel-transaction': sbCancelTransaction_, 'confirm-transaction': sbConfirmTransaction_,
+  'create-debt': sbCreateDebt_, 'update-debt': sbUpdateDebt_, 'delete-debt': sbDeleteDebt_, 'pay-debt': sbPayDebt_,
+  'create-recurring': sbCreateRecurring_, 'update-recurring': sbUpdateRecurring_,
+  'delete-recurring': sbDeleteRecurring_, 'run-recurring-now': sbRunRecurringNow_
+};
 
 /* ============================================================
  * AUTH
@@ -1209,10 +1791,26 @@ function showEmailMode(mode) {
   errEl.style.display = 'none'; errEl.textContent = '';
 }
 
+/** Same idea as applyLoginSuccess_ above, but for a real Supabase Auth
+ *  session object (Phase 2 migration) instead of the old Apps Script token.
+ *  STATE.token becomes the Supabase JWT access_token so later phases can
+ *  send it straight to the Supabase REST/Edge Function endpoints. */
+function applySupabaseSession_(session) {
+  if (!session || !session.access_token || !session.user) throw new Error('เซสชันไม่ถูกต้อง');
+  STATE.token = session.access_token;
+  STATE.userId = session.user.id;
+  STATE.displayName = (session.user.user_metadata && session.user.user_metadata.display_name) || session.user.email || session.user.id;
+  localStorage_safe_set('mma_token', STATE.token);
+  localStorage_safe_set('mma_userId', STATE.userId);
+  localStorage_safe_set('mma_displayName', STATE.displayName);
+  DASH_CACHE = null;
+  TX_CACHE = {};
+  successPopup('เข้าสู่ระบบสำเร็จ', showApp);
+}
+
 /** Shared by PIN login, email login, and email register (which logs the
  *  person straight in) — stores the session and takes them into the app. */
 function applyLoginSuccess_(data) {
-  SESSION_EXPIRY_HANDLED_ = false;
   STATE.token = String(data.token);
   STATE.userId = String(data.userId);
   STATE.displayName = String(data.displayName || STATE.userId);
@@ -1343,11 +1941,9 @@ async function doLoginEmail() {
   loaderWrap.style.display = 'flex';
 
   try {
-    const resp = await apiPost('login-web', { email: email, password: password });
-    if (!resp || !resp.success || !resp.data || !resp.data.token) {
-      throw new Error((resp && resp.error) || 'เข้าสู่ระบบไม่สำเร็จ');
-    }
-    applyLoginSuccess_(resp.data);
+    const { data, error } = await supabaseClient.auth.signInWithPassword({ email, password });
+    if (error) throw new Error(error.message === 'Invalid login credentials' ? 'อีเมลหรือรหัสผ่านไม่ถูกต้อง' : error.message);
+    applySupabaseSession_(data.session);
   } catch (e) {
     const msg = e && e.message ? e.message : 'เข้าสู่ระบบไม่สำเร็จ';
     errEl.textContent = msg;
@@ -1402,11 +1998,21 @@ async function doRegisterEmail() {
   loaderWrap.style.display = 'flex';
 
   try {
-    const resp = await apiPost('register-web', { email: email, password: password, displayName: displayName });
-    if (!resp || !resp.success || !resp.data || !resp.data.token) {
-      throw new Error((resp && resp.error) || 'สมัครสมาชิกไม่สำเร็จ');
+    const { data, error } = await supabaseClient.auth.signUp({
+      email, password,
+      options: { data: { display_name: displayName || email } }
+    });
+    if (error) throw new Error(error.message === 'User already registered' ? 'อีเมลนี้สมัครไว้แล้ว' : error.message);
+
+    if (data.session) {
+      // Email confirmation is OFF in Supabase settings → signed in immediately.
+      applySupabaseSession_(data.session);
+    } else {
+      // Email confirmation is ON → no session yet, must click the link first.
+      errEl.style.display = 'none';
+      toast('สมัครสำเร็จ! เช็คอีเมลเพื่อยืนยันบัญชีก่อนเข้าสู่ระบบ', 'success');
+      showEmailMode('login');
     }
-    applyLoginSuccess_(resp.data);
   } catch (e) {
     const msg = e && e.message ? e.message : 'สมัครสมาชิกไม่สำเร็จ';
     errEl.textContent = msg;
@@ -1420,7 +2026,7 @@ async function doRegisterEmail() {
 }
 
 async function doLogout() {
-  try { await apiGet('logout', { token: STATE.token }); } catch(e) {}
+  try { await supabaseClient.auth.signOut(); } catch(e) {}
   STATE = { token:'', userId:'', displayName:'', categories:[], accounts:[], charts:{} };
   localStorage_safe_remove('mma_token'); localStorage_safe_remove('mma_userId'); localStorage_safe_remove('mma_displayName');
   document.getElementById('app').style.display = 'none';
@@ -2203,7 +2809,7 @@ function updateTxSortLabel() {
  *  since a cached list could otherwise show a stale status badge. */
 let TX_CACHE = {};
 function txCacheKey(params) {
-  return JSON.stringify({ search: params.search||'', type: params.type||'', status: params.status||'', dateFrom: params.dateFrom||'', dateTo: params.dateTo||'', page: params.page, sortDir: params.sortDir||'desc' });
+  return JSON.stringify({ search: params.search||'', type: params.type||'', status: params.status||'', dateFrom: params.dateFrom||'', dateTo: params.dateTo||'', page: params.page });
 }
 
 async function renderTransactions() {
@@ -2267,7 +2873,7 @@ async function renderTransactions() {
       </div>
 
       <div class="tx-result-head">
-        <div class="tx-result-title" id="txResultTitle" onclick="toggleTxSort()" style="cursor:pointer;">รายการล่าสุด</div>
+        <div class="tx-result-title" id="txResultTitle">รายการล่าสุด</div>
         <button class="tx-clear-btn" onclick="goDashboardFilter('')">ดูทั้งหมด</button>
       </div>
 
@@ -2299,28 +2905,14 @@ function applyTxFilters() {
   loadTransactions();
 }
 
-// Bumped on every loadTransactions() call so an older, slower response (e.g.
-// the request fired just before the person toggled sort order) can be told
-// apart from the latest one — without this, a slow "newest→oldest" fetch
-// landing after a fast "oldest→newest" one would silently overwrite the
-// correct list with the wrong order and nothing on screen would explain why.
-let TX_REQ_SEQ_ = 0;
-
 async function loadTransactions() {
   const wrap = document.getElementById('txTableWrap');
   const params = Object.assign({}, TX_STATE.filters, { page: TX_STATE.page, pageSize: TX_STATE.pageSize, sortDir: TX_STATE.sortDir });
   const key = txCacheKey(params);
-  const mySeq = ++TX_REQ_SEQ_;
   if (TX_CACHE[key]) {
-    // Seen this exact filter+page+sort before — show it immediately, no skeleton,
-    // while the fetch below quietly confirms/refreshes it. Re-merge this cache
-    // entry's own items into itemsById right now: itemsById is shared across
-    // every filter/page, so without this, a tap on one of these cached rows
-    // in the moment before the fetch below resolves would look up an ID that
-    // itemsById currently holds from whatever page was loaded last — not this
-    // one — and wrongly report "transaction not found".
-    TX_STATE.itemsById = Object.assign(TX_STATE.itemsById || {}, TX_CACHE[key].items);
-    wrap.innerHTML = TX_CACHE[key].html;
+    // Seen this exact filter+page before — show it immediately, no skeleton,
+    // while the fetch below quietly confirms/refreshes it.
+    wrap.innerHTML = TX_CACHE[key];
   } else {
     // Skeleton rows instead of wiping the whole panel with a spinner — every
     // filter change and page click used to trigger a full-panel loading state;
@@ -2330,19 +2922,13 @@ async function loadTransactions() {
   }
   try {
     const resp = await apiGet('transactions', params);
-    if (mySeq !== TX_REQ_SEQ_) return; // a newer request has since been fired — this response is stale, drop it
     if (!resp.success) throw new Error(resp.error);
     const items = resp.data.items;
-    // Merge rather than replace: itemsById is a lookup shared by every page and
-    // filter combo, so wiping it on each load would make rows from any page
-    // other than the one just fetched unresolvable the instant this runs.
-    const itemsById = {};
-    items.forEach(t => { itemsById[t.ID] = t; });
-    TX_STATE.itemsById = Object.assign(TX_STATE.itemsById || {}, itemsById);
-    if (items.length === 0) { TX_CACHE[key] = { html: emptyState(), items: itemsById }; wrap.innerHTML = TX_CACHE[key].html; return; }
+    TX_STATE.itemsById = {};
+    items.forEach(t => { TX_STATE.itemsById[t.ID] = t; });
+    if (items.length === 0) { TX_CACHE[key] = emptyState(); wrap.innerHTML = TX_CACHE[key]; return; }
     await ensureAccountsLoaded_();
     if (!STATE.categories || !STATE.categories.length) { try { await loadCategories(); } catch (_) {} }
-    if (mySeq !== TX_REQ_SEQ_) return; // re-check after the awaits above, same reason
     let rows = renderTxGrouped(items);
     const totalPages = Math.max(1, Math.ceil(resp.data.total / resp.data.pageSize));
     const html = `
@@ -2353,10 +2939,9 @@ async function loadTransactions() {
         <button class="secondary" onclick="txNextPage()" ${TX_STATE.page>=totalPages?'disabled':''}>ถัดไป →</button>
       </div>
     `;
-    TX_CACHE[key] = { html, items: itemsById };
+    TX_CACHE[key] = html;
     wrap.innerHTML = html;
   } catch (e) {
-    if (mySeq !== TX_REQ_SEQ_) return; // a newer request is already in flight/rendered — don't show this one's error
     if (!TX_CACHE[key]) {
       wrap.innerHTML = errorBlock();
       toast('โหลดรายการไม่สำเร็จ: ' + (e && e.message ? e.message : e), 'error');
@@ -2648,6 +3233,45 @@ function compressImageToBase64(file) {
   });
 }
 
+/** Phase 3: slip photos now live in Supabase Storage (bucket "slips") instead
+ *  of Google Drive. Path is prefixed with the user's id so the storage RLS
+ *  policies (see money_manager_schema.sql) can scope access per-user. */
+async function uploadSlipToSupabase_(file) {
+  const path = `${STATE.userId}/${Date.now()}_${file.name.replace(/[^a-zA-Z0-9.\-_]/g, '_')}`;
+  const { error } = await supabaseClient.storage.from('slips').upload(path, file, {
+    cacheControl: '3600', upsert: false, contentType: file.type || 'image/jpeg'
+  });
+  if (error) throw new Error('อัปโหลดสลิปไม่สำเร็จ: ' + error.message);
+  const { data } = supabaseClient.storage.from('slips').getPublicUrl(path);
+  return { url: data.publicUrl, path };
+}
+
+/** Phase 4: AI slip-reading now runs in the Supabase Edge Function "parse-slip"
+ *  (Gemini → Groq fallback, same prompt/rules ported from parseSlipImage_ in
+ *  444.gs) instead of Apps Script. Note: merchantMemory/duplicateWarning are
+ *  not available yet — they depend on transaction history that still lives in
+ *  Google Sheets until Phase 5 migrates it, so resp.data.duplicateWarning will
+ *  always be undefined for now (the "else if" below just falls through fine). */
+async function callParseSlipFn_(base64, mimeType) {
+  const { data, error } = await supabaseClient.functions.invoke('parse-slip', {
+    body: { image: base64, mimeType: mimeType }
+  });
+  if (error) {
+    // FunctionsHttpError only says "non-2xx status code" — the real reason
+    // (missing secret, bad JWT, AI API error) is in the response body.
+    let detail = error.message || 'เรียก AI ไม่สำเร็จ';
+    try {
+      if (error.context && typeof error.context.json === 'function') {
+        const body = await error.context.json();
+        detail = (body && (body.error || body.message)) || detail;
+        if (error.context.status) detail = `[${error.context.status}] ${detail}`;
+      }
+    } catch (e) {}
+    return { success: false, error: detail };
+  }
+  return data; // already shaped as { success, data: {...} } by the Edge Function
+}
+
 async function handleSlipUpload(inputEl) {
   const file = inputEl.files && inputEl.files[0];
   if (!file) return;
@@ -2655,10 +3279,15 @@ async function handleSlipUpload(inputEl) {
   statusEl.textContent = 'กำลังอ่านสลิป...';
   try {
     const { base64, mimeType } = await compressImageToBase64(file);
-    const resp = await apiPost('parse-slip', { image: base64, mimeType: mimeType });
+    // Upload to Supabase Storage (source of truth for the file itself) and
+    // ask the AI to read the slip's text, in parallel — independent tasks.
+    const [supaSlip, resp] = await Promise.all([
+      uploadSlipToSupabase_(file),
+      callParseSlipFn_(base64, mimeType)
+    ]);
     if (!resp.success) throw new Error(resp.error || 'อ่านสลิปไม่สำเร็จ');
-    CREATE_TX_STATE.slipUrl = resp.data.slipUrl || '';
-    CREATE_TX_STATE.slipFileId = resp.data.slipFileId || '';
+    CREATE_TX_STATE.slipUrl = supaSlip.url;
+    CREATE_TX_STATE.slipFileId = supaSlip.path;
     CREATE_TX_STATE.slipRefNumber = (resp.data.ai && resp.data.ai.referenceNumber) || '';
     if (resp.data.duplicateWarning) {
       // Same slip already recorded elsewhere (e.g. sent to the LINE bot earlier) —
@@ -4369,7 +4998,7 @@ function errorBlock(){ return `<div class="empty">ไม่สามารถโ
 /* ============================================================
  * INIT
  * ============================================================ */
-window.addEventListener('DOMContentLoaded', () => {
+window.addEventListener('DOMContentLoaded', async () => {
   const loginScreen = document.getElementById('loginScreen');
   const app = document.getElementById('app');
   const pinEl = document.getElementById('loginPin');
@@ -4384,7 +5013,17 @@ window.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  if (STATE.token && STATE.userId) {
+  // Single-user setup: log in with the Supabase account created for you in
+  // the dashboard (Authentication → Users), not the old LINE-PIN flow.
+  showLoginTab('email');
+
+  // Source of truth is the real Supabase session (it knows if the token
+  // expired), not just "is something sitting in localStorage".
+  const { data } = await supabaseClient.auth.getSession();
+  if (data && data.session) {
+    applySupabaseSession_(data.session);
+  } else if (STATE.token && STATE.userId) {
+    // Fallback: old Apps Script token from before the Supabase migration.
     loginScreen.style.display = 'none';
     app.style.display = 'block';
     showApp();
@@ -4393,6 +5032,11 @@ window.addEventListener('DOMContentLoaded', () => {
     loginScreen.style.display = 'flex';
     initGoogleSignIn();
   }
+
+  // Keep the app in sync if the session expires/refreshes in the background.
+  supabaseClient.auth.onAuthStateChange((event) => {
+    if (event === 'SIGNED_OUT') doLogout();
+  });
 });
 </script>
 
