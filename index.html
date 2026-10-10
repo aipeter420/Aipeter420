@@ -1630,14 +1630,20 @@ async function sbDashboardFull_() {
   const prevYm = prevDate.toISOString().slice(0, 7);
   const LOW_BALANCE_THRESHOLD = 500, HIGH_SPEND_DAY_MULTIPLIER = 1.5, DUPLICATE_TIME_WINDOW_MIN = 30;
 
-  const [{ data: allTxs }, { data: accounts }, { data: budgets }, { data: profile }] = await Promise.all([
-    supabaseClient.from('transactions').select('*').eq('user_id', STATE.userId),
+  // Only pull what the dashboard needs (previous + current month, 8 latest, pending count) —
+  // fetching every transaction would silently truncate at 1000 rows once old data is imported.
+  const prevMonthStart = prevYm + '-01';
+  const [{ data: windowTxs }, { data: latestTxs }, { count: pendingTotal }, { data: accounts }, { data: budgets }, { data: profile }] = await Promise.all([
+    supabaseClient.from('transactions').select('*').eq('user_id', STATE.userId).gte('transaction_date', prevMonthStart).limit(5000),
+    supabaseClient.from('transactions').select('*').eq('user_id', STATE.userId).order('transaction_date', { ascending: false }).order('transaction_time', { ascending: false }).limit(8),
+    supabaseClient.from('transactions').select('id', { count: 'exact', head: true }).eq('user_id', STATE.userId).eq('status', 'pending'),
     supabaseClient.from('accounts').select('*').eq('user_id', STATE.userId).neq('status', 'archived'),
     supabaseClient.from('budgets').select('*').eq('user_id', STATE.userId).eq('month', ym),
     supabaseClient.from('profiles').select('duplicate_check_excluded_categories').eq('user_id', STATE.userId).single()
   ]);
 
-  const activeTxs = (allTxs || []).filter(t => t.status !== 'cancelled');
+  const allTxs = windowTxs || [];
+  const activeTxs = allTxs.filter(t => t.status !== 'cancelled');
   const thisMonthAll = activeTxs.filter(t => String(t.transaction_date).startsWith(ym));
   const thisMonthExpense = thisMonthAll.filter(t => t.type === 'expense');
   const prevMonthExpense = activeTxs.filter(t => t.type === 'expense' && String(t.transaction_date).startsWith(prevYm));
@@ -1657,9 +1663,7 @@ async function sbDashboardFull_() {
   }
   const curBucket = bucketExpense(thisMonthExpense), prevBucket = bucketExpense(prevMonthExpense);
 
-  const recent = (allTxs || []).slice()
-    .sort((a, b) => new Date(b.transaction_date + ' ' + b.transaction_time) - new Date(a.transaction_date + ' ' + a.transaction_time))
-    .slice(0, 8).map(sbTxRow_);
+  const recent = (latestTxs || []).map(sbTxRow_);
 
   const attentionItems = [];
   (budgets || []).filter(b => Number(b.percentage_used || (Number(b.budget_amount) > 0 ? 0 : 0)) >= 0).forEach(() => {}); // computed below via sbGetBudgets_-equivalent
@@ -1675,7 +1679,7 @@ async function sbDashboardFull_() {
     }
   });
 
-  const pendingCount = (allTxs || []).filter(t => t.status === 'pending').length;
+  const pendingCount = pendingTotal || 0;
   if (pendingCount > 0) attentionItems.push({ type: 'pending', icon: '⏳', text: `มีรายการรอยืนยัน ${pendingCount} รายการ` });
 
   (accounts || []).forEach(a => {
@@ -1753,11 +1757,101 @@ async function sbDashboardFull_() {
   };
 }
 
+/* ---------- DUPLICATE-CHECK EXCLUSIONS ---------- */
+async function sbGetDupExclusions_() {
+  const { data, error } = await supabaseClient.from('profiles').select('duplicate_check_excluded_categories').eq('user_id', STATE.userId).single();
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: { excludedCategories: (data && data.duplicate_check_excluded_categories) || [] } };
+}
+async function sbUpdateDupExclusions_(body) {
+  const cats = Array.isArray(body.excludedCategories) ? body.excludedCategories : [];
+  const { error } = await supabaseClient.from('profiles').update({ duplicate_check_excluded_categories: cats }).eq('user_id', STATE.userId);
+  if (error) return { success: false, error: error.message };
+  return { success: true };
+}
+
+/* ---------- MAINTENANCE TOOLS ---------- */
+// Supabase returns at most 1000 rows per request, so page through everything.
+async function sbFetchAll_(buildQuery) {
+  const out = []; const PAGE = 1000;
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await buildQuery().range(from, from + PAGE - 1);
+    if (error) throw new Error(error.message);
+    out.push(...data);
+    if (data.length < PAGE) break;
+  }
+  return out;
+}
+/** Recomputes every account balance from opening balance + confirmed transactions only. */
+async function sbRebuildBalances_() {
+  try {
+    const { data: accounts, error } = await supabaseClient.from('accounts').select('account_id,opening_balance').eq('user_id', STATE.userId);
+    if (error) throw new Error(error.message);
+    const txs = await sbFetchAll_(() => supabaseClient.from('transactions').select('type,amount,account_id,transfer_to_account_id').eq('user_id', STATE.userId).eq('status', 'confirmed').order('created_at'));
+    const bal = {};
+    accounts.forEach(a => { bal[a.account_id] = Number(a.opening_balance || 0); });
+    txs.forEach(t => {
+      const amt = Number(t.amount || 0);
+      if (t.type === 'income') { if (t.account_id in bal) bal[t.account_id] += amt; }
+      else if (t.type === 'expense') { if (t.account_id in bal) bal[t.account_id] -= amt; }
+      else if (t.type === 'transfer') {
+        if (t.account_id in bal) bal[t.account_id] -= amt;
+        if (t.transfer_to_account_id in bal) bal[t.transfer_to_account_id] += amt;
+      }
+    });
+    await Promise.all(accounts.map(a => supabaseClient.from('accounts').update({ current_balance: bal[a.account_id] }).eq('account_id', a.account_id)));
+    return { success: true, data: { accounts: accounts.length, confirmedTransactions: txs.length } };
+  } catch (e) { return { success: false, error: e.message }; }
+}
+/** Confirmed non-dashboard transactions that landed on the cash account. */
+async function sbAuditCash_() {
+  const { data: accs } = await supabaseClient.from('accounts').select('account_id,account_name').eq('user_id', STATE.userId);
+  const cash = (accs || []).filter(a => a.account_name === 'เงินสด').map(a => a.account_id);
+  if (!cash.length) return { success: true, data: { items: [] } };
+  const { data, error } = await supabaseClient.from('transactions').select('*').eq('user_id', STATE.userId)
+    .eq('status', 'confirmed').neq('source', 'dashboard').in('account_id', cash).order('transaction_date', { ascending: false }).limit(200);
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: { items: data.map(t => ({ id: t.id, date: t.transaction_date, time: t.transaction_time, amount: t.amount, type: t.type, category: t.category, description: t.description, aiGuess: '' })) } };
+}
+async function sbBulkReassign_(body) {
+  const reassignments = body.reassignments || {};
+  const { data: accs } = await supabaseClient.from('accounts').select('account_id').eq('user_id', STATE.userId);
+  const valid = new Set((accs || []).map(a => a.account_id));
+  const moved = [];
+  for (const txId of Object.keys(reassignments)) {
+    if (!valid.has(reassignments[txId])) { moved.push({ txId, error: 'บัญชีปลายทางไม่ถูกต้อง' }); continue; }
+    const { error } = await supabaseClient.from('transactions').update({ account_id: reassignments[txId] }).eq('id', txId).eq('user_id', STATE.userId);
+    moved.push(error ? { txId, error: 'ไม่พบรายการนี้' } : { txId, movedTo: reassignments[txId] });
+  }
+  const rebuild = await sbRebuildBalances_(); // balances of old + new accounts are fixed in one pass
+  return { success: true, data: { moved, rebuild: rebuild.data } };
+}
+
+/* ---------- AI TAB (Edge Function: ai-finance) ---------- */
+async function sbInvoke_(fn, body) {
+  const { data, error } = await supabaseClient.functions.invoke(fn, { body });
+  if (error) {
+    let detail = error.message || 'เรียกฟังก์ชันไม่สำเร็จ';
+    try {
+      if (error.context && typeof error.context.json === 'function') {
+        const b = await error.context.json();
+        detail = (b && (b.error || b.message)) || detail;
+        if (error.context.status) detail = `[${error.context.status}] ${detail}`;
+      }
+    } catch (e) {}
+    return { success: false, error: detail };
+  }
+  return data;
+}
+const sbAiCommand_ = (p) => sbInvoke_('ai-finance', { mode: 'command', q: p.q });
+const sbAiAnalysis_ = () => sbInvoke_('ai-finance', { mode: 'analysis' });
+
 // Actions handled locally via Supabase now — everything else still falls
 // through to Apps Script (apiGet/apiPost above) until it gets its own pass.
 const SB_GET_ACTIONS_ = {
   'categories': sbGetCategories_, 'accounts': sbGetAccounts_, 'budget': sbGetBudgets_, 'transactions': sbGetTransactions_,
-  'debts': sbGetDebts_, 'debt-payments': sbGetDebtPayments_, 'recurring': sbGetRecurring_, 'dashboard-full': sbDashboardFull_
+  'debts': sbGetDebts_, 'debt-payments': sbGetDebtPayments_, 'recurring': sbGetRecurring_, 'dashboard-full': sbDashboardFull_,
+  'duplicate-exclusions': sbGetDupExclusions_, 'audit-cash': sbAuditCash_, 'ai-command': sbAiCommand_, 'ai-analysis': sbAiAnalysis_
 };
 const SB_POST_ACTIONS_ = {
   'create-category': sbCreateCategory_, 'archive-category': sbArchiveCategory_,
@@ -1767,7 +1861,8 @@ const SB_POST_ACTIONS_ = {
   'cancel-transaction': sbCancelTransaction_, 'confirm-transaction': sbConfirmTransaction_,
   'create-debt': sbCreateDebt_, 'update-debt': sbUpdateDebt_, 'delete-debt': sbDeleteDebt_, 'pay-debt': sbPayDebt_,
   'create-recurring': sbCreateRecurring_, 'update-recurring': sbUpdateRecurring_,
-  'delete-recurring': sbDeleteRecurring_, 'run-recurring-now': sbRunRecurringNow_
+  'delete-recurring': sbDeleteRecurring_, 'run-recurring-now': sbRunRecurringNow_,
+  'update-duplicate-exclusions': sbUpdateDupExclusions_, 'rebuild-balances': sbRebuildBalances_, 'bulk-reassign-account': sbBulkReassign_
 };
 
 /* ============================================================
@@ -4436,7 +4531,6 @@ function renderSettings() {
         <div class="settings-item"><span class="k">ชื่อแสดงผล</span><span class="v">${STATE.displayName}</span></div>
       </div>
       <p style="color:var(--muted);font-size:13px;">Money Manager AI — เชื่อมต่อกับ LINE OA ของคุณ พิมพ์รายการหรือส่งรูปสลิปผ่าน LINE เพื่อบันทึกอัตโนมัติ</p>
-      <button class="secondary" id="pinResetBtn" style="margin-right:8px;" onclick="requestPinReset()">🔄 ขอรหัส PIN ใหม่</button>
       <button class="danger" onclick="doLogout()">ออกจากระบบ</button>
     </div>
 
@@ -4462,7 +4556,7 @@ function renderSettings() {
     <div class="card">
       <h3 style="margin-top:0;">🔁 รายการประจำ</h3>
       <p style="color:var(--muted);font-size:12.5px;margin-top:-6px;">
-        ค่าใช้จ่าย/รายรับที่เกิดซ้ำทุกเดือน (ค่าเน็ต ค่าเช่า เงินเดือน) — ถึงวันที่ตั้งไว้ ระบบจะสร้างรายการ "รอยืนยัน" ให้อัตโนมัติแล้วทัก LINE บอก (ต้องตั้ง trigger ครั้งเดียวจาก Apps Script editor ก่อน — รัน <code>setupRecurringTrigger_</code>)
+        ค่าใช้จ่าย/รายรับที่เกิดซ้ำทุกเดือน (ค่าเน็ต ค่าเช่า เงินเดือน) — ใกล้ถึงวันที่ตั้งไว้ ระบบจะแจ้งเตือนทาง LINE ทุกเช้า แล้วกดปุ่ม "รันตอนนี้" ในรายการเพื่อบันทึก (ยังไม่สร้างรายการให้อัตโนมัติ)
       </p>
       <button class="secondary" onclick="openCreateRecurringForm()">➕ เพิ่มรายการประจำ</button>
       <div id="createRecurringFormWrap" style="margin-top:10px;"></div>
@@ -4489,24 +4583,12 @@ function renderSettings() {
     </div>
 
     <div class="card">
-      <h3 style="margin-top:0;">⚙️ ตั้งค่าระบบ (สำหรับแอดมิน)</h3>
+      <h3 style="margin-top:0;">⚙️ ตั้งค่าระบบ</h3>
       <p style="color:var(--muted);font-size:12.5px;margin-top:-6px;">
-        ส่วนนี้ใช้แก้ Script Properties ของระบบ (LINE Token, Groq Key ฯลฯ) โดยไม่ต้องเข้า Apps Script เอง — ใช้ได้เฉพาะผู้ที่รู้ <strong>API Secret</strong> (ตั้งไว้ตอน setup ครั้งแรก) ไม่เกี่ยวกับรหัส PIN ที่ใช้ Login ทั่วไป
+        คีย์ AI (Gemini/Groq) และ LINE เก็บเป็น Secrets ใน Supabase (Edge Functions → Secrets) ไม่ได้แก้จากหน้าเว็บนี้เพื่อความปลอดภัย
       </p>
-      <div id="configStatusList">${loadingHtml('กำลังโหลด')}</div>
-
-      <hr style="border:none;border-top:1px solid var(--card-line);margin:16px 0;">
-
-      <div id="configEditFields"></div>
-
-      <label style="font-size:13px;color:var(--muted);margin-top:6px;display:block;">รหัสยืนยัน (API Secret ปัจจุบัน) *จำเป็น</label>
-      <input id="cfgCurrentSecret" type="password" placeholder="กรอก API Secret ปัจจุบันเพื่อยืนยัน">
-      <div id="cfgError" class="error" style="display:none;"></div>
-      <div id="cfgSuccess" style="display:none;color:var(--income);font-size:13px;margin-bottom:8px;"></div>
-      <button id="saveConfigBtn" onclick="saveConfig()">💾 บันทึกการตั้งค่า</button>
     </div>
   `;
-  loadConfigStatus();
   loadRecurringList();
   loadDupExclusions();
   loadCategoryList();
