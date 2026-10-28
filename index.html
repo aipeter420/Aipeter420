@@ -886,6 +886,9 @@ nav.tabs button.active{color:#657f19;}
     // by design — safe to leave visible in this file, unlike API_URL secrets.
     // Leave the placeholder as-is to simply hide the Google button.
     GOOGLE_CLIENT_ID: "PASTE_YOUR_GOOGLE_CLIENT_ID_HERE.apps.googleusercontent.com",
+    // LINE Login: the Channel ID of your "LINE Login" channel (LINE Developers Console). It is public by design
+    // (the Channel secret lives only in Supabase secrets). Leave the placeholder to simply hide the LINE button.
+    LINE_LOGIN_CHANNEL_ID: "2012257871",
     // Supabase Auth (Phase 2 migration). Find these at Supabase → Settings → API.
     // The anon key is safe to expose publicly — it only works within the RLS
     // policies already set up on the database (see money_manager_schema.sql).
@@ -957,6 +960,11 @@ nav.tabs button.active{color:#657f19;}
     </div>
     <div class="card">
       <div id="loginError" class="error" style="display:none;"></div>
+
+      <div id="lineSignInWrap" style="display:none;margin-bottom:14px;">
+        <button type="button" onclick="startLineLogin(false)" style="background:#06C755;color:#fff;border:none;width:100%;">เข้าสู่ระบบด้วย LINE</button>
+        <div style="text-align:center;color:#9299AD;font-size:12px;margin:14px 0 2px;">หรือ</div>
+      </div>
 
       <div id="googleSignInWrap" style="display:none;margin-bottom:14px;">
         <div id="googleSignInBtn" style="display:flex;justify-content:center;"></div>
@@ -1976,6 +1984,73 @@ function applyLoginSuccess_(data) {
  *  real Client ID has been configured (see APP_CONFIG.GOOGLE_CLIENT_ID). Left
  *  hidden entirely when the placeholder is still in place, rather than
  *  showing a button that would just fail. */
+/* ============================================================
+ * LINE LOGIN (OAuth 2.0 + OpenID Connect). The browser only sends the user to LINE and brings the one-time
+ * `code` back; the Edge Function `line-login` does the token exchange and verification with the channel secret.
+ * ============================================================ */
+function lineLoginConfigured_() {
+  const id = String(APP_CONFIG.LINE_LOGIN_CHANNEL_ID || '').trim();
+  return !!id && !id.includes('PASTE_YOUR_LINE_LOGIN_CHANNEL_ID_HERE');
+}
+function initLineSignIn() {
+  const wrap = document.getElementById('lineSignInWrap');
+  if (wrap && lineLoginConfigured_()) wrap.style.display = 'block';
+}
+function lineRandom_() {
+  const a = new Uint8Array(16); crypto.getRandomValues(a);
+  return Array.from(a, b => b.toString(16).padStart(2, '0')).join('');
+}
+/** link=false: log in with LINE. link=true: attach this LINE account to the account you are logged in with. */
+function startLineLogin(link) {
+  if (!lineLoginConfigured_()) { toast('ยังไม่ได้ตั้งค่า LINE Login', 'error'); return; }
+  const state = lineRandom_(), nonce = lineRandom_();
+  const redirectUri = location.origin + location.pathname;
+  try { sessionStorage.setItem('line_login', JSON.stringify({ state, nonce, redirectUri, link: !!link })); }
+  catch (e) { toast('เบราว์เซอร์นี้ไม่รองรับการเก็บข้อมูลชั่วคราว ลองเปิดด้วย Safari/Chrome', 'error'); return; }
+  const url = 'https://access.line.me/oauth2/v2.1/authorize?response_type=code'
+    + '&client_id=' + encodeURIComponent(String(APP_CONFIG.LINE_LOGIN_CHANNEL_ID).trim())
+    + '&redirect_uri=' + encodeURIComponent(redirectUri)
+    + '&state=' + state + '&scope=' + encodeURIComponent('profile openid') + '&nonce=' + nonce;
+  location.href = url;
+}
+/** Runs once on page load: if we came back from LINE (?code=&state=), finish the login or the linking. */
+async function handleLineCallback_() {
+  const q = new URLSearchParams(location.search);
+  const code = q.get('code'), state = q.get('state');
+  if (!code || !state) return;
+  let saved = null;
+  try { saved = JSON.parse(sessionStorage.getItem('line_login') || 'null'); sessionStorage.removeItem('line_login'); } catch (e) { /* ignore */ }
+  history.replaceState(null, '', location.pathname); // never leave the one-time code in the address bar
+  const fail = msg => {
+    const errEl = document.getElementById('loginError');
+    if (errEl) { errEl.textContent = msg; errEl.style.display = 'block'; }
+    toast(msg, 'error');
+  };
+  if (!saved || saved.state !== state) { fail('เข้าสู่ระบบด้วย LINE ไม่สำเร็จ (ข้อมูลยืนยันไม่ตรง) กรุณาลองใหม่'); return; }
+  try {
+    const { data, error } = await supabaseClient.functions.invoke('line-login', {
+      body: { code, redirectUri: saved.redirectUri, nonce: saved.nonce, link: !!saved.link },
+    });
+    if (error) {
+      let msg = error.message;
+      try { const j = await error.context.json(); if (j && j.error) msg = j.error; } catch (e) { /* keep generic */ }
+      throw new Error(msg);
+    }
+    if (!data || !data.success) throw new Error((data && data.error) || 'เข้าสู่ระบบด้วย LINE ไม่สำเร็จ');
+    if (saved.link) { toast('ผูกบัญชี LINE เรียบร้อยแล้ว', 'success'); return; }
+    const r = await supabaseClient.auth.verifyOtp({ token_hash: data.data.tokenHash, type: 'magiclink' });
+    if (r.error) throw r.error;
+    // the session now exists — the normal startup below picks it up and enters the app
+  } catch (e) { fail('LINE: ' + (e && e.message ? e.message : e)); }
+}
+async function refreshLineLinkStatus_() {
+  const el = document.getElementById('lineLinkStatus'); if (!el) return;
+  try {
+    const { data } = await supabaseClient.from('profiles').select('line_user_id').eq('user_id', STATE.userId).maybeSingle();
+    el.textContent = data && data.line_user_id ? '✅ ผูกบัญชี LINE แล้ว' : 'ยังไม่ได้ผูกบัญชี LINE';
+  } catch (e) { el.textContent = ''; }
+}
+
 function initGoogleSignIn() {
   const clientId = String(APP_CONFIG.GOOGLE_CLIENT_ID || '').trim();
   const wrap = document.getElementById('googleSignInWrap');
@@ -5103,6 +5178,7 @@ async function submitBulkReassign() {
 
 function renderSettings() {
   const el = document.getElementById('tab-settings');
+  setTimeout(refreshLineLinkStatus_, 0);
   el.innerHTML = `
     <div class="card">
       <div class="settings-list">
@@ -5110,6 +5186,7 @@ function renderSettings() {
         <div class="settings-item"><span class="k">ชื่อแสดงผล</span><span class="v">${STATE.displayName}</span></div>
       </div>
       <p style="color:var(--muted);font-size:13px;">Money Manager AI — เชื่อมต่อกับ LINE OA ของคุณ พิมพ์รายการหรือส่งรูปสลิปผ่าน LINE เพื่อบันทึกอัตโนมัติ</p>
+      ${lineLoginConfigured_() ? `<div style="margin:0 0 12px;"><div id="lineLinkStatus" style="font-size:13px;color:var(--muted);margin-bottom:6px;"></div><button type="button" class="secondary" onclick="startLineLogin(true)">🔗 ผูกบัญชี LINE กับบัญชีนี้</button></div>` : ''}
       <button class="danger" onclick="doLogout()">ออกจากระบบ</button>
     </div>
 
@@ -5689,6 +5766,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   // Single-user setup: log in with the Supabase account created for you in
   // the dashboard (Authentication → Users), not the old LINE-PIN flow.
   showLoginTab('email');
+  await handleLineCallback_();
 
   // Source of truth is the real Supabase session (it knows if the token
   // expired), not just "is something sitting in localStorage".
@@ -5703,6 +5781,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   } else {
     app.style.display = 'none';
     loginScreen.style.display = 'flex';
+    initLineSignIn();
     initGoogleSignIn();
   }
 
