@@ -1664,7 +1664,8 @@ function sbThaiMonthLabel_(d) { return `${SB_THAI_MONTHS_[d.getMonth() + 1]} ${d
 function sbSumBy_(txs, type) { return txs.filter(t => t.type === type).reduce((s, t) => s + Number(t.amount || 0), 0); }
 function sbTimeToMinutes_(t) { const p = String(t || '0:0').split(':'); return (Number(p[0]) || 0) * 60 + (Number(p[1]) || 0); }
 
-async function sbDashboardFull_() {
+async function sbDashboardFull_(params) {
+  params = params || {};
   const now = new Date();
   const curYm = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
   const todayStr = now.toISOString().slice(0, 10);
@@ -1672,9 +1673,13 @@ async function sbDashboardFull_() {
   // If the current month has no transactions yet but older ones exist (e.g. an imported statement from last
   // month), show the latest month that has data instead of an all-zero dashboard.
   let ym = curYm;
-  const { data: lastTxRows } = await supabaseClient.from('transactions').select('transaction_date').eq('user_id', STATE.userId).neq('status', 'cancelled').order('transaction_date', { ascending: false }).limit(1);
-  const lastYm = lastTxRows && lastTxRows[0] ? String(lastTxRows[0].transaction_date).slice(0, 7) : '';
-  if (lastYm && lastYm < curYm) ym = lastYm;
+  if (/^\d{4}-\d{2}$/.test(params.month || '')) {
+    ym = params.month; // month picked by the user with the ‹ › buttons
+  } else {
+    const { data: lastTxRows } = await supabaseClient.from('transactions').select('transaction_date').eq('user_id', STATE.userId).neq('status', 'cancelled').order('transaction_date', { ascending: false }).limit(1);
+    const lastYm = lastTxRows && lastTxRows[0] ? String(lastTxRows[0].transaction_date).slice(0, 7) : '';
+    if (lastYm && lastYm < curYm) ym = lastYm;
+  }
   const viewDate = new Date(Number(ym.slice(0, 4)), Number(ym.slice(5, 7)) - 1, 1);
   const prevDate = new Date(viewDate.getFullYear(), viewDate.getMonth() - 1, 1);
   const prevYm = prevDate.getFullYear() + '-' + String(prevDate.getMonth() + 1).padStart(2, '0');
@@ -1742,7 +1747,7 @@ async function sbDashboardFull_() {
   const todayTotal = thisMonthExpense.filter(t => t.transaction_date === todayStr).reduce((s, t) => s + Number(t.amount || 0), 0);
   const priorTotal = thisMonthExpense.filter(t => t.transaction_date !== todayStr).reduce((s, t) => s + Number(t.amount || 0), 0);
   const avgDaily = dayOfMonth > 1 ? priorTotal / (dayOfMonth - 1) : 0;
-  if (avgDaily > 0 && todayTotal > avgDaily * HIGH_SPEND_DAY_MULTIPLIER) {
+  if (ym === curYm && avgDaily > 0 && todayTotal > avgDaily * HIGH_SPEND_DAY_MULTIPLIER) {
     attentionItems.push({ type: 'highSpendToday', icon: '📈', text: `วันนี้ใช้เงินไปแล้ว ฿${Math.round(todayTotal).toLocaleString()} สูงกว่าค่าเฉลี่ยต่อวัน (฿${Math.round(avgDaily).toLocaleString()})`, date: todayStr });
   }
 
@@ -1794,7 +1799,7 @@ async function sbDashboardFull_() {
   return {
     success: true,
     data: {
-      overview: { monthlyIncome, monthlyExpense, balance: (accounts || []).reduce((s, a) => s + Number(a.current_balance || 0), 0), transactionCount: thisMonthAll.length, totalDebtRemaining, viewingPast: ym !== curYm, periodLabel: sbThaiMonthLabel_(viewDate) },
+      overview: { monthlyIncome, monthlyExpense, balance: (accounts || []).reduce((s, a) => s + Number(a.current_balance || 0), 0), transactionCount: thisMonthAll.length, totalDebtRemaining, viewingPast: ym !== curYm, periodLabel: sbThaiMonthLabel_(viewDate), month: ym, currentMonth: curYm },
       recentTransactions: recent,
       accounts: (accounts || []).map(a => ({ AccountID: a.account_id, AccountName: a.account_name, AccountType: a.account_type, CurrentBalance: a.current_balance, Currency: a.currency })),
       expenseByCategory, incomeByCategory,
@@ -2186,6 +2191,7 @@ function showApp() {
   document.getElementById('userNameLabel').textContent = STATE.displayName || STATE.userId;
   initTabs();
   loadCategories();
+  DASH_MONTH_ = '';
   DASH_ANIM_ = { start: Date.now(), dur: 1600 }; // count-up on the dashboard numbers right after login
   switchTab('dashboard');
 }
@@ -2235,12 +2241,15 @@ async function loadCategories() {
  * immediately instead of a spinner every time they tap "ภาพรวม".
  * ============================================================ */
 let DASH_CACHE = null;
+let DASH_MONTH_ = '';            // '' = automatic (this month, or the latest month with data); 'YYYY-MM' = picked with ‹ ›
+let DASH_VIEW_MONTH_ = '', DASH_CUR_MONTH_ = '';
+const DASH_MONTH_CACHE_ = {};
 /* Mirrors the in-memory cache into localStorage so a full page reload still paints
  * last-known numbers instantly (then the normal background fetch refreshes them).
  * Every invalidation goes through clearDashCache_(), which also wipes the stored copy. */
 const DASH_CACHE_KEY_ = 'mma_dash_cache';
 const DASH_CACHE_MAX_AGE_MS_ = 7 * 24 * 3600 * 1000;
-function clearDashCache_() { DASH_CACHE = null; localStorage_safe_remove(DASH_CACHE_KEY_); }
+function clearDashCache_() { DASH_CACHE = null; Object.keys(DASH_MONTH_CACHE_).forEach(k => delete DASH_MONTH_CACHE_[k]); localStorage_safe_remove(DASH_CACHE_KEY_); }
 function saveDashCache_(data) {
   DASH_CACHE = data;
   localStorage_safe_set(DASH_CACHE_KEY_, JSON.stringify({ userId: STATE.userId, savedAt: Date.now(), data: data }));
@@ -2278,21 +2287,35 @@ function countUpDashboard_(root) {
   step();
 }
 
+function dashShiftMonth_(delta) {
+  const base = DASH_VIEW_MONTH_;
+  if (!/^\d{4}-\d{2}$/.test(base)) return;
+  const dt = new Date(Number(base.slice(0, 4)), Number(base.slice(5, 7)) - 1 + delta, 1);
+  const target = dt.getFullYear() + '-' + String(dt.getMonth() + 1).padStart(2, '0');
+  if (DASH_CUR_MONTH_ && target > DASH_CUR_MONTH_) return;
+  DASH_MONTH_ = target;
+  renderDashboard();
+}
+
 async function renderDashboard() {
   const el = document.getElementById('tab-dashboard');
-  if (!DASH_CACHE) DASH_CACHE = readDashCache_(); // survives full page reloads
-  if (DASH_CACHE) {
-    renderDashboardFromData(DASH_CACHE);
+  const auto = !DASH_MONTH_, myMonth = DASH_MONTH_;
+  if (auto && !DASH_CACHE) DASH_CACHE = readDashCache_(); // survives full page reloads
+  const cached = auto ? DASH_CACHE : DASH_MONTH_CACHE_[myMonth];
+  if (cached) {
+    renderDashboardFromData(cached);
   } else {
     el.innerHTML = dashboardSkeleton();
   }
   try {
-    const resp = await apiGet('dashboard-full');
+    const resp = await apiGet('dashboard-full', auto ? {} : { month: myMonth });
     if (!resp.success) throw new Error(resp.error);
-    saveDashCache_(resp.data);
+    if (myMonth !== DASH_MONTH_) return; // user moved to another month meanwhile
+    if (auto) saveDashCache_(resp.data); else DASH_MONTH_CACHE_[myMonth] = resp.data;
     renderDashboardFromData(resp.data);
   } catch (e) {
-    if (!DASH_CACHE) {
+    if (myMonth !== DASH_MONTH_) return;
+    if (!cached) {
       el.innerHTML = errorBlock();
       toast('โหลดภาพรวมไม่สำเร็จ: ' + (e && e.message ? e.message : e), 'error');
     }
@@ -2331,12 +2354,18 @@ function renderDashboardFromData(data) {
     ? { dateFrom: pm + '-01', dateTo: pm + '-' + String(new Date(Number(pm.slice(0, 4)), Number(pm.slice(5, 7)), 0).getDate()).padStart(2, '0') }
     : {};
   const pmArg = JSON.stringify(pmRange).replace(/"/g, '&quot;');
+  DASH_VIEW_MONTH_ = pm; DASH_CUR_MONTH_ = d.currentMonth || '';
+  const canNext = !!pm && !!DASH_CUR_MONTH_ && pm < DASH_CUR_MONTH_;
 
   el.innerHTML = `
     <div class="dash-v4">
       <div class="dash-head">
         <div class="eyebrow eyebrow-lg">ภาพรวมการเงิน</div>
-        <span class="dash-period" style="cursor:default;">${escapeHtml(periodWord)}</span>
+        <div style="display:flex;align-items:center;gap:4px;">
+          <button type="button" class="dash-period" onclick="dashShiftMonth_(-1)" aria-label="เดือนก่อน" style="padding:8px 12px;">‹</button>
+          <span class="dash-period" style="cursor:default;">${escapeHtml(periodWord)}</span>
+          <button type="button" class="dash-period" ${canNext ? 'onclick="dashShiftMonth_(1)"' : 'disabled'} aria-label="เดือนถัดไป" style="padding:8px 12px;${canNext ? '' : 'opacity:.35;'}">›</button>
+        </div>
       </div>
 
       <div class="dash-balance">
@@ -2399,7 +2428,7 @@ function renderDashboardFromData(data) {
 
       <div class="dash-section">
         <div class="dash-section-title">
-          <h3>📊 ค่าใช้จ่ายเดือนนี้</h3>
+          <h3>📊 ค่าใช้จ่าย${escapeHtml(periodWord)}</h3>
           <span class="dash-link" onclick="goDashboardFilter('expense')">ทั้งหมด →</span>
         </div>
         <div class="chart-wrap" style="height:235px;"><canvas id="chartExpenseCat"></canvas></div>
@@ -2430,9 +2459,9 @@ function renderDashboardFromData(data) {
         <div class="dash-insight-title">🤖 AI Insight</div>
         <p>
           ${topExpense
-            ? `เดือนนี้หมวด <b>${escapeHtml(topExpenseName)}</b> เป็นหมวดที่มีค่าใช้จ่ายสูงที่สุด ${baht(topExpenseAmount)}`
+            ? `${escapeHtml(periodWord)}หมวด <b>${escapeHtml(topExpenseName)}</b> เป็นหมวดที่มีค่าใช้จ่ายสูงที่สุด ${baht(topExpenseAmount)}`
             : 'ยังไม่มีข้อมูลเพียงพอสำหรับวิเคราะห์พฤติกรรมการใช้จ่าย'}
-          ${net < 0 ? '<br><span style="color:#F2545B;">⚠️ รายจ่ายเดือนนี้สูงกว่ารายรับ</span>' : ''}
+          ${net < 0 ? `<br><span style="color:#F2545B;">⚠️ รายจ่าย${escapeHtml(periodWord)}สูงกว่ารายรับ</span>` : ''}
         </p>
         <button class="secondary" onclick="switchTab('ai')">ถาม AI เพิ่ม →</button>
       </div>
@@ -3312,6 +3341,14 @@ async function openCreateTxUI() {
         <button type="button" class="ctx-type-btn" data-type="transfer" onclick="setCreateTxType('transfer')">🔁 โอนเงิน</button>
       </div>
 
+      <label class="filter-date" style="margin-bottom:12px;"><span>จำนวนเงิน</span>
+        <input id="ctxAmount" type="number" placeholder="0.00" inputmode="decimal" style="font-size:26px;font-weight:800;">
+      </label>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin:-4px 0 12px;">
+        ${[20, 50, 100, 500].map(n => `<button type="button" class="secondary" style="padding:6px 12px;font-size:13px;" onclick="ctxAddAmount_(${n})">+${n}</button>`).join('')}
+        <button type="button" class="secondary" style="padding:6px 12px;font-size:13px;" onclick="ctxAddAmount_(0)">ล้าง</button>
+      </div>
+
       <label class="ctx-slip-label" for="ctxSlipInput">
         <span>📷</span>
         <span>แนบสลิป — ให้ AI อ่านแล้วเติมข้อมูลให้อัตโนมัติ (ไม่บังคับ)</span>
@@ -3319,12 +3356,10 @@ async function openCreateTxUI() {
       </label>
       <div id="ctxSlipStatus" style="font-size:12px;color:var(--muted);margin:2px 0 14px;min-height:14px;"></div>
 
-      <label class="filter-date" style="margin-bottom:10px;"><span>จำนวนเงิน</span>
-        <input id="ctxAmount" type="number" placeholder="0.00" inputmode="decimal">
-      </label>
-
       <div id="ctxCategoryWrap">
-        <label class="filter-date" style="margin-bottom:10px;"><span>หมวดหมู่</span>
+        <div class="filter-date" style="margin-bottom:6px;"><span>หมวดหมู่</span></div>
+        <div id="ctxCatChips" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;"></div>
+        <label class="filter-date" style="display:none;"><span>หมวดหมู่</span>
           <select id="ctxCategory">${expenseCats.map(c => `<option value="${escapeHtml(c.CategoryName)}">${c.Icon||''} ${escapeHtml(c.CategoryName)}</option>`).join('')}</select>
         </label>
       </div>
@@ -3349,6 +3384,8 @@ async function openCreateTxUI() {
         <label class="filter-date" style="min-width:0;"><span>เวลา</span><input id="ctxTime" type="time" value="${timeStr}"></label>
       </div>
 
+      <button type="button" class="secondary" id="ctxMoreBtn" onclick="setCtxMore_()" style="width:100%;margin-bottom:12px;">＋ รายละเอียดเพิ่มเติม (ชื่อร้าน, หมายเหตุ, รายการประจำ)</button>
+      <div id="ctxMoreWrap" style="display:none;">
       <label class="filter-date" style="margin-bottom:16px;"><span>รายละเอียด (ไม่บังคับ)</span>
         <input id="ctxDescription" placeholder="เช่น ค่าข้าวเที่ยง">
       </label>
@@ -3369,13 +3406,64 @@ async function openCreateTxUI() {
           </label>
         </div>
       </div>` : `<div id="ctxRecurringWrap" style="display:none;"></div>`}
+      </div>
 
-      <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <div style="display:flex;gap:8px;position:sticky;bottom:0;background:#fff;margin:12px -18px calc(-18px - env(safe-area-inset-bottom, 0px));padding:10px 18px calc(10px + env(safe-area-inset-bottom, 0px));">
         <button class="secondary" onclick="closeCreateTxUI()">ยกเลิก</button>
-        <button id="ctxSaveBtn" onclick="submitCreateTx()">บันทึก</button>
+        <button id="ctxSaveBtn" onclick="submitCreateTx()" style="flex:1;">บันทึก</button>
       </div>
     </div>`;
   document.body.appendChild(overlay);
+  ctxApplyLast_('expense');
+  ctxRenderCatChips_();
+  setTimeout(() => { const a = document.getElementById('ctxAmount'); if (a) a.focus(); }, 60);
+}
+
+/** Quick amount buttons: +N adds to what is typed, 0 clears. */
+function ctxAddAmount_(n) {
+  const el = document.getElementById('ctxAmount'); if (!el) return;
+  el.value = n === 0 ? '' : String(Math.round(((Number(el.value) || 0) + n) * 100) / 100);
+}
+/** Category chips mirror the (hidden) select so every other code path that reads/sets the select keeps working. */
+function ctxRenderCatChips_() {
+  const sel = document.getElementById('ctxCategory'), box = document.getElementById('ctxCatChips');
+  if (!sel || !box) return;
+  box.innerHTML = Array.from(sel.options).map(o => {
+    const on = o.value === sel.value;
+    return `<button type="button" class="${on ? '' : 'secondary'}" style="padding:6px 12px;font-size:13px;" onclick="ctxPickCat_(this.dataset.v)" data-v="${escapeHtml(o.value)}">${escapeHtml(o.textContent.trim())}</button>`;
+  }).join('');
+}
+function ctxPickCat_(v) {
+  const sel = document.getElementById('ctxCategory'); if (!sel) return;
+  sel.value = v; ctxRenderCatChips_();
+}
+
+/** Collapses/expands the optional fields (merchant, note, recurring). Called with no argument to toggle. */
+function setCtxMore_(open) {
+  const wrap = document.getElementById('ctxMoreWrap'), btn = document.getElementById('ctxMoreBtn');
+  if (!wrap) return;
+  const show = typeof open === 'boolean' ? open : wrap.style.display === 'none';
+  wrap.style.display = show ? '' : 'none';
+  if (btn) btn.style.display = show ? 'none' : '';
+}
+
+/** Remembers the last account / category used so the next entry starts from them instead of the first list item. */
+function ctxRemember_(type, body) {
+  try {
+    if (type === 'transfer') return;
+    if (body.accountId) localStorage.setItem('ctx_last_account', body.accountId);
+    if (body.category) localStorage.setItem('ctx_last_cat_' + type, body.category);
+  } catch (e) { /* storage unavailable — fine */ }
+}
+function ctxApplyLast_(type, catOnly) {
+  try {
+    const pick = (selId, val) => {
+      const sel = document.getElementById(selId);
+      if (sel && val && Array.from(sel.options).some(o => o.value === val)) sel.value = val;
+    };
+    if (!catOnly) pick('ctxAccount', localStorage.getItem('ctx_last_account'));
+    pick('ctxCategory', localStorage.getItem('ctx_last_cat_' + type));
+  } catch (e) { /* ignore */ }
 }
 
 function closeCreateTxUI() {
@@ -3408,6 +3496,8 @@ function setCreateTxType(type) {
     if (recurringWrap) recurringWrap.style.display = '';
     const cats = (STATE.categories || []).filter(c => type === 'income' ? c.Type === 'income' : c.Type !== 'income');
     document.getElementById('ctxCategory').innerHTML = cats.map(c => `<option value="${escapeHtml(c.CategoryName)}">${c.Icon||''} ${escapeHtml(c.CategoryName)}</option>`).join('');
+    ctxApplyLast_(type, true);
+    ctxRenderCatChips_();
   }
 }
 
@@ -3475,6 +3565,11 @@ function openStatementImportUI() {
       </div>
     </div>`;
   document.body.appendChild(overlay);
+  try {
+    const last = localStorage.getItem('stmt_last_account');
+    const sel = document.getElementById('stmtAccount');
+    if (last && sel && Array.from(sel.options).some(o => o.value === last)) sel.value = last;
+  } catch (e) { /* ignore */ }
 }
 function closeStatementImportUI() {
   if (STMT.busy && !confirm('กำลังทำงานอยู่ ปิดตอนนี้อาจนำเข้าไม่ครบ ต้องการปิดจริงหรือไม่?')) return;
@@ -3527,8 +3622,9 @@ async function onStatementFilePicked(input) {
     const d = resp.data || {};
     if (!d.parsed) throw new Error(d.aiError || 'AI อ่านรายการไม่สำเร็จ');
     if (!d.rows || !d.rows.length) throw new Error('ไม่พบรายการธุรกรรมในไฟล์นี้');
-    STMT.meta = { bank: d.bank || '', dropped: d.dropped || 0, truncated: !!d.truncated, fileName: file.name };
+    STMT.meta = { bank: d.bank || '', dropped: d.dropped || 0, truncated: !!d.truncated, fileName: file.name, summary: d.summary || null, autoCount: 0 };
     STMT.rows = d.rows.map((r, i) => Object.assign({ idx: i, checked: true, dupe: false }, r));
+    await applyHistoryCategories_();
     await refreshStatementDupes_();
     status.textContent = '';
   } catch (e) {
@@ -3540,6 +3636,72 @@ async function onStatementFilePicked(input) {
     const pb = document.getElementById('stmtPickBtn'); if (pb) pb.disabled = false;
     renderStatementPreview_();
   }
+}
+
+/** Category memory: rows whose category the AI left at the default get the category this user most often
+ *  gave to the same payee (same type) in their own history — no extra table, it is derived from transactions. */
+const stmtKey_ = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+const stmtIsDefaultCat_ = r => r.category === 'อื่นๆ' || (r.type === 'income' && r.category === 'รายได้เสริม');
+async function applyHistoryCategories_() {
+  try {
+    const { data } = await supabaseClient.from('transactions').select('merchant,type,category')
+      .eq('user_id', STATE.userId).neq('status', 'cancelled').neq('category', 'อื่นๆ').neq('merchant', '').limit(5000);
+    const tally = {};
+    (data || []).forEach(t => {
+      const m = stmtKey_(t.merchant); if (!m) return;
+      const k = t.type + '|' + m;
+      tally[k] = tally[k] || {};
+      tally[k][t.category] = (tally[k][t.category] || 0) + 1;
+    });
+    let n = 0;
+    STMT.rows.forEach(r => {
+      const m = stmtKey_(r.merchant);
+      if (!m || !stmtIsDefaultCat_(r)) return;
+      const c = tally[r.type + '|' + m]; if (!c) return;
+      r.category = Object.entries(c).sort((a, b) => b[1] - a[1])[0][0];
+      r.autoCat = true; n++;
+    });
+    STMT.meta.autoCount = n;
+  } catch (e) { /* history lookup is a convenience only */ }
+}
+function stmtCatOptions_(type, current) {
+  const cats = (STATE.categories || []).filter(c => type === 'income' ? c.Type === 'income' : c.Type !== 'income');
+  const names = cats.map(c => c.CategoryName);
+  const opts = cats.map(c => `<option value="${escapeHtml(c.CategoryName)}" ${c.CategoryName === current ? 'selected' : ''}>${c.Icon || ''} ${escapeHtml(c.CategoryName)}</option>`);
+  if (current && names.indexOf(current) === -1) opts.unshift(`<option value="${escapeHtml(current)}" selected>${escapeHtml(current)}</option>`);
+  return opts.join('');
+}
+/** Changing one row's category also applies it to the other rows with the same payee that were not edited by hand. */
+function stmtSetCat_(i, cat) {
+  const r = STMT.rows.find(x => x.idx === i); if (!r) return;
+  r.category = cat; r.autoCat = false; r.manual = true;
+  const k = stmtKey_(r.merchant); let n = 0;
+  if (k) STMT.rows.forEach(o => {
+    if (o !== r && !o.manual && o.type === r.type && stmtKey_(o.merchant) === k) { o.category = cat; o.autoCat = true; n++; }
+  });
+  if (n) toast(`ใช้หมวด "${cat}" กับอีก ${n} รายการของ ${r.merchant} ด้วย`, 'info');
+  renderStatementPreview_();
+}
+/** Compares what the AI read with the totals the statement itself prints (when it prints any). */
+function stmtReconcileHtml_() {
+  const s = STMT.meta && STMT.meta.summary; if (!s) return '';
+  const inc = STMT.rows.filter(r => r.type === 'income').reduce((a, r) => a + r.amount, 0);
+  const exp = STMT.rows.filter(r => r.type === 'expense').reduce((a, r) => a + r.amount, 0);
+  const net = inc - exp, tol = 0.5;
+  const signed = n => (n >= 0 ? '+' : '-') + baht(Math.abs(n));
+  const msgs = []; let checked = 0;
+  if (s.openingBalance != null && s.closingBalance != null) {
+    checked++;
+    const diff = s.closingBalance - s.openingBalance;
+    // either sign accepted: credit-card statements show the balance owed, which moves the opposite way
+    if (Math.abs(diff - net) > tol && Math.abs(diff + net) > tol) msgs.push(`ยอดคงเหลือใน Statement เปลี่ยน ${signed(diff)} แต่รายการที่อ่านได้รวม ${signed(net)}`);
+  }
+  if (s.totalIncome != null) { checked++; if (Math.abs(s.totalIncome - inc) > tol) msgs.push(`รวมเงินเข้าใน Statement ${baht(s.totalIncome)} แต่อ่านได้ ${baht(inc)}`); }
+  if (s.totalExpense != null) { checked++; if (Math.abs(s.totalExpense - exp) > tol) msgs.push(`รวมเงินออกใน Statement ${baht(s.totalExpense)} แต่อ่านได้ ${baht(exp)}`); }
+  if (!checked) return '';
+  return msgs.length
+    ? `<div class="stmt-hint" style="margin:0 0 8px;color:#B45309;">⚠️ ยอดไม่ตรงกับ Statement — ${msgs.map(escapeHtml).join(' · ')} อาจอ่านรายการขาดหรือเกิน ตรวจก่อนนำเข้า</div>`
+    : `<div class="stmt-hint" style="margin:0 0 8px;color:var(--mint-dark);">✅ ยอดรวมตรงกับที่ Statement ระบุ</div>`;
 }
 
 /** Marks rows that already exist in the app (same date + amount touching this account) as
@@ -3583,7 +3745,15 @@ function renderStatementPreview_() {
   if (STMT.meta.truncated) warn.push('⚠️ ไฟล์ยาวมาก AI อ่านได้ไม่ครบ — ตรวจจำนวนรายการ แล้วนำเข้าช่วงที่เหลือแยกอีกรอบ');
   if (STMT.meta.dropped) warn.push(`ข้าม ${STMT.meta.dropped} แถวที่อ่านวันที่/ยอดไม่ได้`);
   if (dupes) warn.push(`พบ ${dupes} รายการที่อาจซ้ำกับที่มีอยู่แล้ว (ติ๊กออกให้ก่อน)`);
+  const accSel = document.getElementById('stmtAccount');
+  const accObj = (STATE.accounts || []).find(a => accSel && a.AccountID === accSel.value);
+  const accBar = `<div style="background:#F4FBD8;border:1px solid #D7F36B;border-radius:12px;padding:8px 12px;margin-bottom:8px;font-size:13px;">📥 จะนำเข้าเข้าบัญชี: <b>${escapeHtml(accObj ? accObj.AccountName : '-')}</b> <small style="color:var(--muted);">(เปลี่ยนได้ที่ช่องด้านบน)</small></div>`;
+  if (STMT.meta.autoCount) warn.push(`🏷️ จัดหมวดให้อัตโนมัติ ${STMT.meta.autoCount} รายการ จากประวัติของคุณ — แก้ได้ที่ช่องหมวดของแต่ละรายการ`);
+  const keepList = box.querySelector('.stmt-list'), keepModal = box.closest('.modal-box');
+  const keepTop = keepList ? keepList.scrollTop : 0, keepModalTop = keepModal ? keepModal.scrollTop : 0;
   box.innerHTML = `
+    ${accBar}
+    ${stmtReconcileHtml_()}
     <div class="stmt-sum">
       <span>${STMT.meta.bank ? escapeHtml(STMT.meta.bank) + ' · ' : ''}อ่านได้ ${STMT.rows.length} รายการ</span>
       <span>เลือก ${sel.length}</span>
@@ -3603,7 +3773,7 @@ function renderStatementPreview_() {
             <div class="stmt-title">${escapeHtml(r.description || r.merchant || r.category)}</div>
             <div class="stmt-meta">
               <span>${thaiDateShort_(r.date)}${r.time ? ' ' + r.time : ''}</span>
-              <span>${escapeHtml(r.category)}</span>
+              <select onchange="stmtSetCat_(${r.idx}, this.value)" aria-label="หมวดหมู่" style="width:auto;min-width:0;height:auto;margin:0;padding:2px 6px;font-size:12px;border-radius:8px;">${stmtCatOptions_(r.type, r.category)}</select>${r.autoCat ? '<span title="จัดหมวดจากประวัติ">🏷️</span>' : ''}
               ${r.merchant && r.description ? `<span>${escapeHtml(r.merchant)}</span>` : ''}
               ${r.dupe ? '<span class="stmt-dupe">อาจซ้ำ</span>' : ''}
             </div>
@@ -3614,6 +3784,8 @@ function renderStatementPreview_() {
           </div>
         </div>`).join('')}
     </div>`;
+  const nl = box.querySelector('.stmt-list'); if (nl) nl.scrollTop = keepTop;
+  if (keepModal) keepModal.scrollTop = keepModalTop;
   if (btn) { btn.disabled = STMT.busy || sel.length === 0; btn.textContent = sel.length ? `นำเข้า ${sel.length} รายการ` : 'นำเข้า'; }
 }
 function stmtToggle_(i, on) { const r = STMT.rows.find(x => x.idx === i); if (r) r.checked = !!on; renderStatementPreview_(); }
@@ -3659,6 +3831,7 @@ async function confirmStatementImport() {
     if (net) await sbAdjustAccountBalance_(accountId, Math.round(net * 100) / 100);
   } catch (e) { failed = e && e.message ? e.message : String(e); }
   STMT.busy = false;
+  if (done > 0) { try { localStorage.setItem('stmt_last_account', accountId); } catch (e) { /* ignore */ } }
   clearDashCache_(); TX_CACHE = {}; BUDGET_CACHE = {};
   try { const r = await apiGet('accounts'); if (r && r.success) STATE.accounts = r.data; } catch (e) {}
   if (failed) {
@@ -3801,13 +3974,14 @@ function applySlipAiToForm(ai) {
   if (ai.description) document.getElementById('ctxDescription').value = ai.description;
   else if (ai.merchant) document.getElementById('ctxDescription').value = ai.merchant;
   if (ai.merchant) document.getElementById('ctxMerchant').value = ai.merchant;
+  if (ai.description || ai.merchant) setCtxMore_(true);
   const guess = guessAccountId(ai.account);
   if (CREATE_TX_STATE.type === 'transfer') {
     if (guess) document.getElementById('ctxFromAccount').value = guess;
   } else {
     if (ai.category) {
       const sel = document.getElementById('ctxCategory');
-      if (Array.from(sel.options).some(o => o.value === ai.category)) sel.value = ai.category;
+      if (Array.from(sel.options).some(o => o.value === ai.category)) { sel.value = ai.category; ctxRenderCatChips_(); }
     }
     if (guess) document.getElementById('ctxAccount').value = guess;
   }
@@ -3864,6 +4038,7 @@ async function submitCreateTx() {
       }
     }
 
+    ctxRemember_(type, body);
     toast('เพิ่มรายการเรียบร้อยแล้ว', 'success');
     clearDashCache_(); TX_CACHE = {}; BUDGET_CACHE = {};
     closeCreateTxUI();
