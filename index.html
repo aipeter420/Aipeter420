@@ -961,11 +961,6 @@ nav.tabs button.active{color:#657f19;}
     <div class="card">
       <div id="loginError" class="error" style="display:none;"></div>
 
-      <div id="lineSignInWrap" style="display:none;margin-bottom:14px;">
-        <button type="button" onclick="startLineLogin(false)" style="background:#06C755;color:#fff;border:none;width:100%;">เข้าสู่ระบบด้วย LINE</button>
-        <div style="text-align:center;color:#9299AD;font-size:12px;margin:14px 0 2px;">หรือ</div>
-      </div>
-
       <div id="googleSignInWrap" style="display:none;margin-bottom:14px;">
         <div id="googleSignInBtn" style="display:flex;justify-content:center;"></div>
         <div style="text-align:center;color:#9299AD;font-size:12px;margin:14px 0 2px;">หรือ</div>
@@ -999,6 +994,11 @@ nav.tabs button.active{color:#657f19;}
           <button id="registerSubmitBtn" onclick="doRegisterEmail()" style="margin-top:12px;">สมัครสมาชิก</button>
           <p class="hint">มีบัญชีแล้ว? <a href="#" onclick="showEmailMode('login');return false;" style="color:var(--mint-dark,#5C7318);font-weight:700;text-decoration:none;">เข้าสู่ระบบ</a></p>
         </div>
+      </div>
+
+      <div id="lineSignInWrap" style="display:none;margin-top:14px;">
+        <div style="text-align:center;color:#9299AD;font-size:12px;margin:0 0 12px;">หรือ</div>
+        <button type="button" onclick="startLineLogin(false)" style="background:#06C755;color:#fff;border:none;width:100%;">เข้าสู่ระบบด้วย LINE</button>
       </div>
 
       <div id="loginLoaderWrap" style="display:none;"></div>
